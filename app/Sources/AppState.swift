@@ -27,7 +27,7 @@ class AppState: ObservableObject {
         static let gracefulTerminationAttempts = 20
         static let forceTerminationAttempts = 10
         static let launchPollAttempts = 30
-        static let processSettleDelay: TimeInterval = 2.0
+        static let processSettleDelay: TimeInterval = 5.0
         static let toolDiscoveryTimeout: TimeInterval = 15.0
     }
 
@@ -272,6 +272,14 @@ class AppState: ObservableObject {
             stdin.fileHandleForWriting.write(jsonrpc.data(using: .utf8)!)
             stdin.fileHandleForWriting.closeFile()
 
+            var stdoutData = Data()
+            let readGroup = DispatchGroup()
+            readGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+                readGroup.leave()
+            }
+
             let timer = DispatchSource.makeTimerSource()
             timer.schedule(deadline: .now() + Config.toolDiscoveryTimeout)
             timer.setEventHandler { process.terminate() }
@@ -280,8 +288,9 @@ class AppState: ObservableObject {
             process.waitUntilExit()
             timer.cancel()
 
-            let data = stdout.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
+            readGroup.wait()
+
+            let output = String(data: stdoutData, encoding: .utf8) ?? ""
             return parseToolsFromOutput(output)
         } catch {
             return []
@@ -347,16 +356,16 @@ class AppState: ObservableObject {
 
     // MARK: - Config Persistence
 
-    /// Writes the gateway configuration and root .mcp.json for the selected project.
     func saveConfig() {
         guard let project = selectedProject else { return }
-        let gatewayConfigPath = "\(project.path)/\(Config.gatewayConfigPath)"
-        let mcpJsonPath = "\(project.path)/.mcp.json"
+        let projectPath = project.path.hasSuffix("/") ? String(project.path.dropLast()) : project.path
+        let gatewayConfigPath = "\(projectPath)/\(Config.gatewayConfigPath)"
+        let mcpJsonPath = "\(projectPath)/.mcp.json"
 
         var gatewayServers: [String: GatewayServerConfig] = [:]
 
         for server in servers {
-            let command = resolveCommand(server.command, projectPath: project.path)
+            let command = resolveCommand(server.command, projectPath: projectPath)
             let toolsFilter: GatewayServerConfig.ToolsFilter
 
             if server.tools.isEmpty || server.tools.allSatisfy(\.enabled) {
@@ -380,7 +389,7 @@ class AppState: ObservableObject {
         let gatewayConfig = GatewayConfig(servers: gatewayServers)
 
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
 
         if let data = try? encoder.encode(gatewayConfig) {
             try? data.write(to: URL(fileURLWithPath: gatewayConfigPath))
@@ -398,7 +407,7 @@ class AppState: ObservableObject {
             ]
         ]
 
-        if let data = try? JSONSerialization.data(withJSONObject: mcpJson, options: [.prettyPrinted, .sortedKeys]) {
+        if let data = try? JSONSerialization.data(withJSONObject: mcpJson, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
             try? FileManager.default.removeItem(atPath: mcpJsonPath)
             try? data.write(to: URL(fileURLWithPath: mcpJsonPath))
         }
@@ -406,7 +415,6 @@ class AppState: ObservableObject {
 
     // MARK: - Claude Desktop Lifecycle
 
-    /// Saves configuration, terminates Claude Desktop, and relaunches it.
     func applyAndRestart() {
         guard !isRestarting else { return }
         saveConfig()
@@ -416,9 +424,8 @@ class AppState: ObservableObject {
             guard let self else { return }
 
             self.terminateClaude()
-            self.killStaleMCPProcesses()
-            Thread.sleep(forTimeInterval: Config.processSettleDelay)
-            self.launchClaudeAndWait()
+            Thread.sleep(forTimeInterval: 2.0)
+            self.launchClaudeViaFinder()
 
             DispatchQueue.main.async {
                 self.isClaudeRunning = self.findClaudeApp() != nil
@@ -427,14 +434,27 @@ class AppState: ObservableObject {
         }
     }
 
-    /// Launches Claude Desktop without terminating it first.
+    private func showNotification(title: String, body: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = [
+            "-e",
+            "display notification \"\(body)\" with title \"\(title)\""
+        ]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
+    }
+
     func startClaude() {
         guard !isRestarting else { return }
+        saveConfig()
         isRestarting = true
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            self.launchClaudeAndWait()
+            self.launchClaudeViaFinder()
 
             DispatchQueue.main.async {
                 self.isClaudeRunning = self.findClaudeApp() != nil
@@ -459,17 +479,17 @@ class AppState: ObservableObject {
         }
     }
 
-    private func launchClaudeAndWait() {
-        let claudeURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Config.claudeBundleId)
-        if let url = claudeURL {
-            let config = NSWorkspace.OpenConfiguration()
-            config.activates = true
-            let semaphore = DispatchSemaphore(value: 0)
-            NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in
-                semaphore.signal()
-            }
-            semaphore.wait()
-        }
+    private func launchClaudeViaFinder() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = [
+            "-e",
+            "tell application \"Finder\" to open POSIX file \"/Applications/Claude.app\""
+        ]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
 
         for _ in 0..<Config.launchPollAttempts {
             Thread.sleep(forTimeInterval: Config.pollStep)
@@ -483,16 +503,6 @@ class AppState: ObservableObject {
         NSWorkspace.shared.runningApplications.first {
             $0.bundleIdentifier == Config.claudeBundleId
         }
-    }
-
-    private func killStaleMCPProcesses() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        process.arguments = ["-f", "mcp-gateway"]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try? process.run()
-        process.waitUntilExit()
     }
 
     /// Opens a project's directory in Finder.

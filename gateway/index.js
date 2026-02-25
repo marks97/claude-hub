@@ -1,7 +1,11 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync } from "fs";
 import { resolve } from "path";
 
@@ -12,7 +16,23 @@ if (!CONFIG_PATH) {
 }
 
 const config = JSON.parse(readFileSync(resolve(CONFIG_PATH), "utf-8"));
-const upstreams = new Map();
+
+const allTools = [];
+const toolToUpstream = new Map();
+const upstreamClients = new Map();
+
+function sanitizeAnnotations(annotations) {
+  if (!annotations || typeof annotations !== "object") return undefined;
+  const clean = {};
+  for (const [key, value] of Object.entries(annotations)) {
+    if (typeof value === "string" || typeof value === "boolean") {
+      clean[key] = value;
+    } else if (value !== null && value !== undefined) {
+      clean[key] = String(value);
+    }
+  }
+  return Object.keys(clean).length > 0 ? clean : undefined;
+}
 
 async function connectUpstream(name, serverConfig) {
   const client = new Client({ name: `gateway->${name}`, version: "1.0.0" });
@@ -28,7 +48,6 @@ async function connectUpstream(name, serverConfig) {
   };
 
   await client.connect(transport);
-
   const { tools } = await client.listTools();
 
   const allowedTools =
@@ -36,95 +55,80 @@ async function connectUpstream(name, serverConfig) {
       ? tools
       : tools.filter((t) => serverConfig.tools.includes(t.name));
 
-  upstreams.set(name, { client, tools: allowedTools });
+  upstreamClients.set(name, client);
+
+  for (const tool of allowedTools) {
+    if (toolToUpstream.has(tool.name)) {
+      process.stderr.write(
+        `[warning] tool "${tool.name}" from "${name}" conflicts with "${toolToUpstream.get(tool.name)}", skipping\n`
+      );
+      continue;
+    }
+    toolToUpstream.set(tool.name, name);
+
+    const sanitized = { ...tool };
+    if (sanitized.annotations) {
+      sanitized.annotations = sanitizeAnnotations(sanitized.annotations);
+    }
+    delete sanitized._upstream;
+    allTools.push(sanitized);
+  }
+
   process.stderr.write(
     `[${name}] connected: ${allowedTools.length}/${tools.length} tools\n`
   );
-
-  return allowedTools.map((t) => ({ ...t, _upstream: name }));
 }
 
 async function main() {
-  const gateway = new McpServer(
+  const server = new Server(
     { name: "mcp-gateway", version: "1.0.0" },
     { capabilities: { tools: {} } }
   );
 
-  const registeredTools = new Map();
-  let toolCount = 0;
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: allTools,
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const upstreamName = toolToUpstream.get(name);
+
+    if (!upstreamName) {
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${name}` }],
+        isError: true,
+      };
+    }
+
+    const client = upstreamClients.get(upstreamName);
+    try {
+      const result = await client.callTool({ name, arguments: args || {} });
+      return result;
+    } catch (err) {
+      return {
+        content: [
+          { type: "text", text: `[${upstreamName}] ${err.message}` },
+        ],
+        isError: true,
+      };
+    }
+  });
 
   for (const [name, serverConfig] of Object.entries(config.servers)) {
     if (!serverConfig.enabled) continue;
     try {
-      const tools = await connectUpstream(name, serverConfig);
-      for (const tool of tools) {
-        const upstreamName = tool._upstream;
-
-        if (registeredTools.has(tool.name)) {
-          process.stderr.write(
-            `[warning] tool "${tool.name}" from "${upstreamName}" ` +
-              `conflicts with "${registeredTools.get(tool.name)}", skipping\n`
-          );
-          continue;
-        }
-        registeredTools.set(tool.name, upstreamName);
-
-        const schema = tool.inputSchema || { type: "object", properties: {} };
-
-        // The MCP SDK's tool() expects a Zod-like schema where each property
-        // is { type: "string", description }. This flattens all property types
-        // to strings — upstream servers must handle type coercion.
-        const proxySchema = {};
-        if (schema.properties) {
-          for (const [key, prop] of Object.entries(schema.properties)) {
-            proxySchema[key] = {
-              type: "string",
-              description: prop.description || "",
-            };
-          }
-        }
-
-        const validKeys = new Set(Object.keys(schema.properties || {}));
-
-        gateway.tool(
-          tool.name,
-          tool.description || "",
-          proxySchema,
-          async (args) => {
-            const upstream = upstreams.get(upstreamName);
-            const cleanArgs = {};
-            for (const [k, v] of Object.entries(args)) {
-              if (validKeys.has(k)) cleanArgs[k] = v;
-            }
-            try {
-              const result = await upstream.client.callTool({
-                name: tool.name,
-                arguments: cleanArgs,
-              });
-              return result;
-            } catch (err) {
-              return {
-                content: [
-                  { type: "text", text: `[${upstreamName}] ${err.message}` },
-                ],
-                isError: true,
-              };
-            }
-          }
-        );
-
-        toolCount++;
-      }
+      await connectUpstream(name, serverConfig);
     } catch (err) {
       process.stderr.write(`[${name}] failed to connect: ${err.message}\n`);
     }
   }
 
-  const transport = new StdioServerTransport();
-  await gateway.connect(transport);
   process.stderr.write(
-    `Gateway ready: ${toolCount} tools from ${upstreams.size} servers\n`
+    `Gateway ready: ${allTools.length} tools from ${upstreamClients.size} servers\n`
   );
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
 }
 
 main().catch((err) => {

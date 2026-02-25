@@ -50,6 +50,15 @@ struct HeaderView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Theme.textPrimary)
             Spacer()
+            Button {
+                NSApplication.shared.terminate(nil)
+            } label: {
+                Image(systemName: "power")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+            .buttonStyle(.plain)
+            .help("Quit MCPHub")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -233,7 +242,6 @@ struct FooterView: View {
                 if appState.isClaudeRunning {
                     appState.applyAndRestart()
                 } else {
-                    appState.saveConfig()
                     appState.startClaude()
                 }
             } label: {
@@ -242,14 +250,11 @@ struct FooterView: View {
                         ProgressView()
                             .controlSize(.mini)
                             .tint(Theme.light)
-                    } else if appState.isClaudeRunning {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10))
                     } else {
-                        Image(systemName: "play.fill")
+                        Image(systemName: appState.isClaudeRunning ? "arrow.clockwise" : "play.fill")
                             .font(.system(size: 10))
                     }
-                    Text(appState.isRestarting ? "Starting..." : appState.isClaudeRunning ? "Apply & Restart" : "Start Claude")
+                    Text(appState.isRestarting ? "Restarting..." : appState.isClaudeRunning ? "Apply & Restart" : "Start Claude")
                         .font(.system(size: 11, weight: .medium))
                 }
                 .foregroundStyle(Theme.light)
