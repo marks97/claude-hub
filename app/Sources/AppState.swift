@@ -62,8 +62,8 @@ class AppState: ObservableObject {
     private static func findGatewayPath() -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates = [
-            "\(home)/Documents/claude-desktop-manager/gateway",
-            "\(home)/claude-desktop-manager/gateway",
+            "\(home)/Documents/claude-hub/gateway",
+            "\(home)/claude-hub/gateway",
             Bundle.main.resourcePath.map { "\($0)/gateway" } ?? "",
         ]
         for path in candidates {
@@ -250,7 +250,7 @@ class AppState: ObservableObject {
         process.standardOutput = stdout
         process.standardError = Pipe()
 
-        let jsonrpc = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"claude-desktop-manager\",\"version\":\"1.0.0\"}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+        let jsonrpc = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"claude-hub\",\"version\":\"1.0.0\"}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
 
         do {
             try process.run()

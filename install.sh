@@ -3,10 +3,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$SCRIPT_DIR/app"
-APP_NAME="ClaudeDesktopManager"
+APP_NAME="ClaudeHub"
 APP_DIR="/Applications/$APP_NAME.app"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
-LAUNCH_AGENT="$LAUNCH_AGENT_DIR/com.claudedesktopmanager.app.plist"
+LAUNCH_AGENT="$LAUNCH_AGENT_DIR/com.claudehub.app.plist"
 
 NODE_PATH=$(command -v node 2>/dev/null || true)
 if [ -z "$NODE_PATH" ]; then
@@ -28,7 +28,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
-cp ".build/release/ClaudeDesktopManager" "$APP_DIR/Contents/MacOS/ClaudeDesktopManager"
+cp ".build/release/ClaudeHub" "$APP_DIR/Contents/MacOS/ClaudeHub"
 cp Info.plist "$APP_DIR/Contents/Info.plist"
 cp AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 
@@ -41,10 +41,10 @@ cat > "$LAUNCH_AGENT" << EOF
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claudedesktopmanager.app</string>
+    <string>com.claudehub.app</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/ClaudeDesktopManager.app/Contents/MacOS/ClaudeDesktopManager</string>
+        <string>/Applications/ClaudeHub.app/Contents/MacOS/ClaudeHub</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

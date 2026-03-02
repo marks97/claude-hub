@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "ClaudeDesktopManager",
+    name: "ClaudeHub",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "ClaudeDesktopManager",
+            name: "ClaudeHub",
             path: "Sources"
         )
     ]

@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Entry point for the Claude Desktop Manager application.
+/// Entry point for the Claude Hub application.
 @main
-struct ClaudeDesktopManagerApp: App {
+struct ClaudeHubApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
