@@ -1,18 +1,19 @@
 import SwiftUI
 
-/// Entry point for the Claude Desktop Manager menu bar application.
+/// Entry point for the Claude Desktop Manager application.
 @main
 struct ClaudeDesktopManagerApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarView()
+        WindowGroup {
+            MainWindowView()
                 .environmentObject(appState)
-        } label: {
-            Image(systemName: appState.isRestarting ? "arrow.triangle.2.circlepath" : "server.rack")
-                .symbolRenderingMode(.hierarchical)
         }
-        .menuBarExtraStyle(.window)
+        .windowStyle(.titleBar)
+        .defaultSize(width: 900, height: 600)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+        }
     }
 }

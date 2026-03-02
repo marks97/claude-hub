@@ -10,7 +10,6 @@ class AppState: ObservableObject {
     @Published var servers: [ServerState] = []
     @Published var isDiscovering = false
     @Published var isRestarting = false
-    @Published var isProjectExpanded = true
     @Published var isClaudeRunning = false
 
     private let gatewayPath: String
@@ -94,28 +93,15 @@ class AppState: ObservableObject {
 
     /// Presents a native folder picker dialog for adding a project.
     func showAddProject() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", "return POSIX path of (choose folder with prompt \"Select a project folder\")"]
+        let panel = NSOpenPanel()
+        panel.title = "Select a project folder"
+        panel.message = "Choose a folder containing .claude/infra/.mcp.json"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
 
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = Pipe()
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !path.isEmpty {
-                    DispatchQueue.main.async {
-                        self?.addProject(path: path)
-                    }
-                }
-            } catch {}
-        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        addProject(path: url.path)
     }
 
     /// Adds a project at the given path if it contains an MCP configuration.
