@@ -39,14 +39,14 @@ struct MenuBarView: View {
     }
 }
 
-/// Top bar showing the MCPHub branding.
+/// Top bar showing the Claude Desktop Manager branding.
 struct HeaderView: View {
     var body: some View {
         HStack {
             Image(systemName: "server.rack")
                 .foregroundStyle(Theme.orange)
                 .font(.system(size: 14, weight: .semibold))
-            Text("MCPHub")
+            Text("Claude Desktop Manager")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Theme.textPrimary)
             Spacer()
@@ -58,7 +58,7 @@ struct HeaderView: View {
                     .foregroundStyle(Theme.textTertiary)
             }
             .buttonStyle(.plain)
-            .help("Quit MCPHub")
+            .help("Quit Claude Desktop Manager")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

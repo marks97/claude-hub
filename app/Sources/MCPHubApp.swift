@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Entry point for the MCPHub menu bar application.
+/// Entry point for the Claude Desktop Manager menu bar application.
 @main
-struct MCPHubApp: App {
+struct ClaudeDesktopManagerApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {

@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "MCPHub",
+    name: "ClaudeDesktopManager",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "MCPHub",
+            name: "ClaudeDesktopManager",
             path: "Sources"
         )
     ]

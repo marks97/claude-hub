@@ -3,10 +3,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$SCRIPT_DIR/app"
-APP_NAME="MCPHub"
+APP_NAME="ClaudeDesktopManager"
 APP_DIR="/Applications/$APP_NAME.app"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
-LAUNCH_AGENT="$LAUNCH_AGENT_DIR/com.mcphub.app.plist"
+LAUNCH_AGENT="$LAUNCH_AGENT_DIR/com.claudedesktopmanager.app.plist"
 
 NODE_PATH=$(command -v node 2>/dev/null || true)
 if [ -z "$NODE_PATH" ]; then
@@ -28,7 +28,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
-cp ".build/release/MCPHub" "$APP_DIR/Contents/MacOS/MCPHub"
+cp ".build/release/ClaudeDesktopManager" "$APP_DIR/Contents/MacOS/ClaudeDesktopManager"
 cp Info.plist "$APP_DIR/Contents/Info.plist"
 
 echo "Installing launch agent (start at login)..."
@@ -40,10 +40,10 @@ cat > "$LAUNCH_AGENT" << EOF
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.mcphub.app</string>
+    <string>com.claudedesktopmanager.app</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/MCPHub.app/Contents/MacOS/MCPHub</string>
+        <string>/Applications/ClaudeDesktopManager.app/Contents/MacOS/ClaudeDesktopManager</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
