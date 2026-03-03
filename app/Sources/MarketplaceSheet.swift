@@ -13,6 +13,23 @@ struct MarketplaceSheet: View {
     @State private var prefillName = ""
     @State private var prefillCommand = ""
     @State private var prefillArgs = ""
+    @State private var activeCategory: String?
+
+    private let categories = [
+        ("GitHub", "github"),
+        ("Database", "database"),
+        ("Search", "search"),
+        ("Files", "file"),
+        ("AI", "ai"),
+        ("Cloud", "cloud"),
+        ("Slack", "slack"),
+        ("Google", "google"),
+    ]
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+    ]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,7 +46,9 @@ struct MarketplaceSheet: View {
                 }
                 .buttonStyle(.plain)
             }
-            .padding(20)
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
 
             // Search bar
             HStack(spacing: 8) {
@@ -37,11 +56,27 @@ struct MarketplaceSheet: View {
                     .foregroundStyle(Theme.textTertiary)
                 TextField("Search MCP servers...", text: $searchQuery)
                     .textFieldStyle(.plain)
-                    .onSubmit { search() }
+                    .onSubmit {
+                        activeCategory = nil
+                        search(query: searchQuery)
+                    }
 
                 if isSearching {
                     ProgressView()
                         .controlSize(.small)
+                }
+
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                        activeCategory = nil
+                        search(query: "")
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(10)
@@ -49,8 +84,18 @@ struct MarketplaceSheet: View {
             .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
             .padding(.horizontal, 20)
 
+            // Category chips
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(categories, id: \.1) { label, query in
+                        categoryChip(label: label, query: query)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+            }
+
             Divider()
-                .padding(.top, 12)
 
             // Results
             if let error = errorMessage {
@@ -63,19 +108,24 @@ struct MarketplaceSheet: View {
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.textSecondary)
                         .multilineTextAlignment(.center)
+                    Button("Retry") {
+                        search(query: searchQuery)
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.orange)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity)
             } else if results.isEmpty && !isSearching {
                 VStack(spacing: 8) {
                     Spacer()
-                    Image(systemName: "magnifyingglass")
+                    Image(systemName: "square.grid.2x2")
                         .font(.system(size: 28))
                         .foregroundStyle(Theme.textTertiary)
-                    Text("Search the official MCP registry")
+                    Text("Browse the MCP registry")
                         .font(.system(size: 13))
                         .foregroundStyle(Theme.textSecondary)
-                    Text("Find servers to add to your project")
+                    Text("Search or pick a category above")
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.textTertiary)
                     Spacer()
@@ -83,16 +133,16 @@ struct MarketplaceSheet: View {
                 .frame(maxWidth: .infinity)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 8) {
+                    LazyVGrid(columns: columns, spacing: 12) {
                         ForEach(results) { server in
-                            serverRow(server)
+                            serverCard(server)
                         }
                     }
                     .padding(16)
                 }
             }
         }
-        .frame(width: 550, height: 500)
+        .frame(width: 620, height: 560)
         .sheet(isPresented: $showAddSheet) {
             AddServerSheet(
                 serverName: prefillName,
@@ -101,75 +151,156 @@ struct MarketplaceSheet: View {
             )
             .environmentObject(appState)
         }
-        .onAppear { search() }
+        .onAppear { search(query: "") }
     }
 
-    private func serverRow(_ server: RegistryServer) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "server.rack")
-                .font(.system(size: 16))
-                .foregroundStyle(Theme.blue)
-                .frame(width: 24, height: 24)
+    private func categoryChip(label: String, query: String) -> some View {
+        let isActive = activeCategory == query
+        return Button {
+            if isActive {
+                activeCategory = nil
+                searchQuery = ""
+                search(query: "")
+            } else {
+                activeCategory = query
+                searchQuery = query
+                search(query: query)
+            }
+        } label: {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(isActive ? .white : Theme.textSecondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(isActive ? Theme.orange : Theme.pampas)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(server.server.name)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.textPrimary)
+    private func serverCard(_ server: RegistryServer) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Icon + name header
+            HStack(spacing: 10) {
+                serverIcon(server)
 
-                if let desc = server.server.description {
-                    Text(desc)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.textSecondary)
-                        .lineLimit(2)
-                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(server.server.displayName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
 
-                if let packages = server.server.packages, let first = packages.first {
-                    HStack(spacing: 4) {
+                    if let packages = server.server.packages, let first = packages.first {
                         Text(first.registryType)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Theme.blue)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Theme.blue.opacity(0.1))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(Theme.orange)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Theme.orange.opacity(0.1))
                             .clipShape(Capsule())
-
-                        Text(first.identifier)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(Theme.textTertiary)
-                            .lineLimit(1)
                     }
                 }
+
+                Spacer()
             }
+            .padding(12)
 
-            Spacer()
-
-            Button {
-                addFromRegistry(server)
-            } label: {
-                Text("Add")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white)
+            // Description
+            if let desc = server.server.description, !desc.isEmpty {
+                Text(desc)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
-                    .padding(.vertical, 5)
-                    .background(Theme.orange)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                    .padding(.bottom, 10)
             }
-            .buttonStyle(.plain)
+
+            Spacer(minLength: 0)
+
+            // Footer: package identifier + add button
+            Divider()
+                .foregroundStyle(Theme.cardBorder)
+
+            HStack {
+                if let packages = server.server.packages, let first = packages.first {
+                    Text(first.identifier)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                Button {
+                    addFromRegistry(server)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 9))
+                        Text("Add")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Theme.orange)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
         }
-        .padding(12)
+        .frame(minHeight: 140)
         .background(Theme.cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: Theme.cornerRadius)
                 .stroke(Theme.cardBorder, lineWidth: 0.5)
         )
+        .shadow(color: .black.opacity(0.04), radius: 2, y: 1)
     }
 
-    private func search() {
+    @ViewBuilder
+    private func serverIcon(_ server: RegistryServer) -> some View {
+        if let iconURL = server.server.iconURL {
+            AsyncImage(url: iconURL) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 32, height: 32)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                case .failure:
+                    serverIconPlaceholder
+                default:
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 32, height: 32)
+                }
+            }
+        } else {
+            serverIconPlaceholder
+        }
+    }
+
+    private var serverIconPlaceholder: some View {
+        Image(systemName: "server.rack")
+            .font(.system(size: 16))
+            .foregroundStyle(Theme.textTertiary)
+            .frame(width: 32, height: 32)
+            .background(Theme.pampas)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func search(query: String) {
         isSearching = true
         errorMessage = nil
 
-        appState.searchRegistry(query: searchQuery) { result in
+        appState.searchRegistry(query: query) { result in
             isSearching = false
             switch result {
             case .success(let servers):
@@ -182,14 +313,14 @@ struct MarketplaceSheet: View {
 
     private func addFromRegistry(_ server: RegistryServer) {
         guard let pkg = server.server.packages?.first else {
-            prefillName = server.server.name
+            prefillName = server.server.displayName
             prefillCommand = ""
             prefillArgs = ""
             showAddSheet = true
             return
         }
 
-        prefillName = server.server.name
+        prefillName = server.server.displayName
 
         switch pkg.registryType {
         case "npm":
@@ -198,7 +329,7 @@ struct MarketplaceSheet: View {
         case "pypi":
             prefillCommand = "uvx"
             prefillArgs = pkg.identifier
-        case "docker":
+        case "docker", "oci":
             prefillCommand = "docker"
             prefillArgs = "run --rm -i \(pkg.identifier)"
         default:

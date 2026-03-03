@@ -82,12 +82,8 @@ struct ProjectRow: View {
 
             if isHovered || instanceInfo.isRestarting {
                 HStack(spacing: 4) {
-                    // Play/restart button (only when isolation is ON)
-                    if appState.settings.projectIsolation {
-                        ProjectPlayButton(project: project)
-                    }
+                    ProjectPlayButton(project: project)
 
-                    // Remove button
                     Button {
                         appState.removeProject(project)
                     } label: {

@@ -9,6 +9,7 @@ struct ClaudeHubApp: App {
         WindowGroup {
             MainWindowView()
                 .environmentObject(appState)
+                .accentColor(Theme.orange)
         }
         .defaultSize(width: 900, height: 600)
         .commands {

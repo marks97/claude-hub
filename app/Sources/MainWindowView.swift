@@ -19,7 +19,7 @@ struct MainWindowView: View {
         .navigationSplitViewStyle(.balanced)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                claudeStatusIndicator
+                claudeStatusMenu
                 refreshButton
 
                 Button {
@@ -39,58 +39,81 @@ struct MainWindowView: View {
         }
     }
 
-    private var claudeStatusIndicator: some View {
-        Group {
-            if appState.settings.projectIsolation {
-                // Per-project isolation: show selected project's instance state
-                let info = selectedProjectInfo
-                Button {
-                    guard let project = appState.selectedProject else { return }
-                    if info.isRunning {
-                        appState.restartClaudeForProject(project)
-                    } else {
-                        appState.launchClaudeForProject(project)
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(info.isRunning ? Theme.green : Theme.red)
-                            .frame(width: 8, height: 8)
-                        Text(info.isRunning ? "Claude Running" : "Claude Stopped")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(Theme.textSecondary)
-                    }
-                    .padding(.vertical, 4)
-                }
-                .buttonStyle(.plain)
-                .padding(.trailing, 12)
-                .disabled(info.isRestarting || appState.selectedProject == nil)
-                .help(info.isRunning ? "Click to restart Claude for this project" : "Click to start Claude for this project")
-            } else {
-                // Global: single Claude instance
-                Button {
-                    if appState.isClaudeRunning {
+    private var claudeStatusMenu: some View {
+        Menu {
+            // Global Claude actions
+            Section("Shared Instance") {
+                if appState.isClaudeRunning {
+                    Button {
                         appState.applyAndRestart()
-                    } else {
+                    } label: {
+                        Label("Restart Claude", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(appState.isRestarting)
+                } else {
+                    Button {
                         appState.startClaude()
+                    } label: {
+                        Label("Start Claude", systemImage: "play.fill")
                     }
-                } label: {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(appState.isClaudeRunning ? Theme.green : Theme.red)
-                            .frame(width: 8, height: 8)
-                        Text(appState.isClaudeRunning ? "Claude Running" : "Claude Stopped")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(Theme.textSecondary)
-                    }
-                    .padding(.vertical, 4)
+                    .disabled(appState.isRestarting)
                 }
-                .buttonStyle(.plain)
-                .padding(.trailing, 12)
-                .disabled(appState.isRestarting)
-                .help(appState.isClaudeRunning ? "Click to restart Claude Desktop" : "Click to start Claude Desktop")
             }
+
+            // Per-project isolated instance actions
+            if let project = appState.selectedProject {
+                let info = appState.projectInstances[project.id] ?? ProjectInstanceInfo()
+                Section("Isolated (\(project.name))") {
+                    if info.isRunning {
+                        Button {
+                            appState.restartClaudeForProject(project)
+                        } label: {
+                            Label("Restart Isolated", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(info.isRestarting)
+                    } else {
+                        Button {
+                            appState.launchClaudeForProject(project)
+                        } label: {
+                            Label("Start Isolated", systemImage: "play.fill")
+                        }
+                        .disabled(info.isRestarting)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                Text(statusText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .padding(.vertical, 4)
         }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .padding(.trailing, 12)
+    }
+
+    private var statusColor: Color {
+        let info = selectedProjectInfo
+        if info.isRunning || appState.isClaudeRunning {
+            return Theme.green
+        }
+        return Theme.red
+    }
+
+    private var statusText: String {
+        let info = selectedProjectInfo
+        if info.isRunning {
+            return "Isolated"
+        }
+        if appState.isClaudeRunning {
+            return "Claude Running"
+        }
+        return "Claude Stopped"
     }
 
     private var selectedProjectInfo: ProjectInstanceInfo {

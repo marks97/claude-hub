@@ -105,7 +105,6 @@ struct ProjectInstanceInfo {
 
 /// Persisted application settings.
 struct AppSettings: Codable {
-    var projectIsolation: Bool = false
     var registryURLs: [String] = ["https://registry.modelcontextprotocol.io/v0.1/servers"]
 }
 
@@ -117,14 +116,36 @@ struct RegistrySearchResponse: Codable {
 }
 
 struct RegistryServer: Identifiable, Codable {
-    var id: String { server.name }
+    var id: String { "\(server.name)-\(server.version ?? "")" }
     let server: RegistryServerDetail
 }
 
 struct RegistryServerDetail: Codable {
     let name: String
     let description: String?
+    let title: String?
+    let version: String?
     let packages: [RegistryPackage]?
+    let icons: [RegistryIcon]?
+
+    /// Display name: use title if available, otherwise the last path component of the name.
+    var displayName: String {
+        if let title, !title.isEmpty { return title }
+        return name.components(separatedBy: "/").last ?? name
+    }
+
+    /// First available icon URL.
+    var iconURL: URL? {
+        guard let src = icons?.first?.src else { return nil }
+        return URL(string: src)
+    }
+}
+
+struct RegistryIcon: Codable {
+    let src: String
+    let mimeType: String?
+    let sizes: [String]?
+    let theme: String?
 }
 
 struct RegistryPackage: Codable {

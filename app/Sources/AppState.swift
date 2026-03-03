@@ -19,10 +19,7 @@ class AppState: ObservableObject {
     @Published var projectInstances: [String: ProjectInstanceInfo] = [:]
 
     var anyProjectRestarting: Bool {
-        if settings.projectIsolation {
-            return projectInstances.values.contains { $0.isRestarting }
-        }
-        return isRestarting
+        isRestarting || projectInstances.values.contains { $0.isRestarting }
     }
 
     private let gatewayPath: String
@@ -81,25 +78,24 @@ class AppState: ObservableObject {
         claudePollingTimer = Timer.scheduledTimer(withTimeInterval: Config.pollingInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
 
-            if self.settings.projectIsolation {
-                // Per-project: check each project's PID
-                for (projectId, info) in self.projectInstances {
-                    guard !info.isRestarting, let pid = info.pid else { continue }
-                    let running = kill(pid, 0) == 0
-                    if running != info.isRunning {
-                        self.projectInstances[projectId] = ProjectInstanceInfo(
-                            isRunning: running,
-                            isRestarting: false,
-                            pid: running ? pid : nil
-                        )
-                    }
-                }
-            } else {
-                // Global: check by bundle ID
-                guard !self.isRestarting else { return }
+            // Global Claude check
+            if !self.isRestarting {
                 let running = self.findClaudeApp() != nil
                 if running != self.isClaudeRunning {
                     self.isClaudeRunning = running
+                }
+            }
+
+            // Per-project isolated instance checks
+            for (projectId, info) in self.projectInstances {
+                guard !info.isRestarting, let pid = info.pid else { continue }
+                let running = kill(pid, 0) == 0
+                if running != info.isRunning {
+                    self.projectInstances[projectId] = ProjectInstanceInfo(
+                        isRunning: running,
+                        isRestarting: false,
+                        pid: running ? pid : nil
+                    )
                 }
             }
         }
@@ -582,11 +578,9 @@ class AppState: ObservableObject {
         }
 
         // Also update Claude Desktop config in isolation dir if it exists
-        if settings.projectIsolation {
-            let settingsDir = claudeSettingsDir(for: project)
-            if FileManager.default.fileExists(atPath: settingsDir) {
-                writeClaudeDesktopConfig(for: project)
-            }
+        let settingsDir = claudeSettingsDir(for: project)
+        if FileManager.default.fileExists(atPath: settingsDir) {
+            writeClaudeDesktopConfig(for: project)
         }
     }
 

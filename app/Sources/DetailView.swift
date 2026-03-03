@@ -115,11 +115,15 @@ struct ProjectDetailView: View {
                     Text("Marketplace")
                 }
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.white)
+                .foregroundStyle(Theme.orange)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .background(Theme.blue)
+                .background(Theme.orange.opacity(0.1))
                 .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.smallCornerRadius)
+                        .stroke(Theme.orange.opacity(0.3), lineWidth: 1)
+                )
             }
             .buttonStyle(.plain)
         }
@@ -198,11 +202,15 @@ struct ProjectDetailView: View {
                         Text("Marketplace")
                     }
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.orange)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
-                    .background(Theme.blue)
+                    .background(Theme.orange.opacity(0.1))
                     .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.smallCornerRadius)
+                            .stroke(Theme.orange.opacity(0.3), lineWidth: 1)
+                    )
                 }
                 .buttonStyle(.plain)
             }

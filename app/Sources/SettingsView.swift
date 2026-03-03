@@ -8,26 +8,6 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle(isOn: Binding(
-                    get: { appState.settings.projectIsolation },
-                    set: { newValue in
-                        appState.settings.projectIsolation = newValue
-                        appState.saveSettings()
-                    }
-                )) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Project Isolation")
-                            .font(.system(size: 13, weight: .medium))
-                        Text("Each project runs its own Claude Desktop instance in an isolated data directory at ~/claude-{project-name}. Multiple projects can run Claude simultaneously.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            } header: {
-                Text("Claude Desktop")
-            }
-
-            Section {
                 ForEach(appState.settings.registryURLs, id: \.self) { url in
                     HStack {
                         Text(url)
@@ -40,7 +20,7 @@ struct SettingsView: View {
                             appState.saveSettings()
                         } label: {
                             Image(systemName: "minus.circle.fill")
-                                .foregroundStyle(.red)
+                                .foregroundStyle(Theme.red)
                         }
                         .buttonStyle(.plain)
                         .disabled(appState.settings.registryURLs.count <= 1)
@@ -65,7 +45,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 340)
+        .frame(width: 500, height: 240)
     }
 
     private func addRegistryURL() {
