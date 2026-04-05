@@ -22,18 +22,32 @@ struct MainWindowView: View {
                 claudeStatusMenu
                 refreshButton
 
-                Button {
-                    appState.showAddProject()
+                Menu {
+                    Button {
+                        appState.showAddProject()
+                    } label: {
+                        Label("Add Project", systemImage: "folder.badge.plus")
+                    }
+
+                    Button {
+                        appState.showingAddCloudInstance = true
+                    } label: {
+                        Label("Add Cloud Instance", systemImage: "cloud.fill")
+                    }
                 } label: {
-                    Label("Add Project", systemImage: "plus")
+                    Label("Add", systemImage: "plus")
                 }
-                .help("Add a project folder")
+                .help("Add project or cloud instance")
             }
         }
         .frame(
             minWidth: Theme.windowMinWidth,
             minHeight: Theme.windowMinHeight
         )
+        .sheet(isPresented: $appState.showingAddCloudInstance) {
+            AddCloudInstanceSheet()
+                .environmentObject(appState)
+        }
         .onChange(of: isLoading) { _, loading in
             isSpinning = loading
         }

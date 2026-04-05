@@ -7,26 +7,49 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Section header
-            Text("Projects")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Theme.textTertiary)
-                .textCase(.uppercase)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Projects section header
+                    Text("Projects")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textTertiary)
+                        .textCase(.uppercase)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 8)
 
-            if appState.projects.isEmpty {
-                EmptySidebarView()
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(appState.projects) { project in
-                            ProjectRow(project: project)
+                    if appState.projects.isEmpty {
+                        EmptySidebarView()
+                    } else {
+                        VStack(spacing: 2) {
+                            ForEach(appState.projects) { project in
+                                ProjectRow(project: project)
+                            }
                         }
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 8)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 8)
+
+                    // Cloud Instances section header
+                    Text("Cloud Instances")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textTertiary)
+                        .textCase(.uppercase)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 16)
+                        .padding(.bottom, 8)
+
+                    if appState.cloudInstances.isEmpty {
+                        EmptyCloudInstancesView()
+                    } else {
+                        VStack(spacing: 2) {
+                            ForEach(appState.cloudInstances) { instance in
+                                CloudInstanceRow(instance: instance)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 8)
+                    }
                 }
             }
         }
@@ -262,5 +285,40 @@ struct ProjectAvatar: View {
             .foregroundStyle(.white)
             .frame(width: size, height: size)
             .background(Circle().fill(isSelected ? Theme.orange : Theme.textSecondary))
+    }
+}
+
+/// Placeholder shown when no cloud instances exist.
+struct EmptyCloudInstancesView: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "cloud")
+                .font(.system(size: 20))
+                .foregroundStyle(Theme.textTertiary)
+
+            Text("No cloud instances")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Theme.textSecondary)
+
+            Button {
+                appState.showingAddCloudInstance = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "plus")
+                    Text("Add Instance")
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Theme.blue)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
     }
 }

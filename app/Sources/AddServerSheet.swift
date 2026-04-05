@@ -138,7 +138,10 @@ struct AddServerSheet: View {
         let config = MCPServerConfig(
             command: cmd,
             args: argsList.isEmpty ? nil : argsList,
-            env: env.isEmpty ? nil : env
+            env: env.isEmpty ? nil : env,
+            type: nil,
+            url: nil,
+            headersHelper: nil
         )
 
         appState.addServer(name: name, config: config)

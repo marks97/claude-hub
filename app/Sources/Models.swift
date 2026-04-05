@@ -66,6 +66,10 @@ struct MCPServerConfig: Codable {
     let command: String?
     let args: [String]?
     let env: [String: String]?
+    // HTTP-type servers (e.g. PostHog)
+    let type: String?
+    let url: String?
+    let headersHelper: String?
 }
 
 /// Container for the mcpServers dictionary in .mcp.json.
@@ -131,14 +135,24 @@ class ServerState: ObservableObject, Identifiable {
     let command: String
     let args: [String]
     let env: [String: String]
+    // HTTP-type servers bypass the gateway
+    let serverType: String?
+    let url: String?
+    let headersHelper: String?
 
-    init(name: String, enabled: Bool, tools: [DiscoveredTool], command: String, args: [String], env: [String: String]) {
+    var isHTTP: Bool { serverType == "http" }
+
+    init(name: String, enabled: Bool, tools: [DiscoveredTool], command: String, args: [String], env: [String: String],
+         serverType: String? = nil, url: String? = nil, headersHelper: String? = nil) {
         self.name = name
         self.enabled = enabled
         self.tools = tools
         self.command = command
         self.args = args
         self.env = env
+        self.serverType = serverType
+        self.url = url
+        self.headersHelper = headersHelper
     }
 
     var enabledToolCount: Int {
@@ -165,6 +179,11 @@ struct AppSettings: Codable {
     var isolationPrefix: String = ""
     /// Text appended to the project name in the Dock (e.g. " (Claude)").
     var isolationSuffix: String = ""
+
+    // Cloud defaults
+    var awsDefaultRegion: String = "us-east-1"
+    var defaultSSHKeyPath: String = ""
+    var defaultDockerfilePath: String = ""
 
     /// Builds the display name shown in the Dock for an isolated instance.
     func isolationDisplayName(for projectName: String) -> String {
@@ -228,4 +247,163 @@ struct RegistryArgument: Codable {
 struct RegistryMetadata: Codable {
     let nextCursor: String?
     let count: Int?
+}
+
+// MARK: - Cloud Instances
+
+/// The type of cloud instance / remote environment.
+enum CloudInstanceType: String, Codable, CaseIterable, Hashable {
+    case ssh
+    case ec2
+    case fargate
+    case docker
+
+    var displayName: String {
+        switch self {
+        case .ssh: return "SSH"
+        case .ec2: return "EC2"
+        case .fargate: return "Fargate"
+        case .docker: return "Docker"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .ssh: return "terminal"
+        case .ec2: return "server.rack"
+        case .fargate: return "shippingbox"
+        case .docker: return "cube"
+        }
+    }
+}
+
+/// Lifecycle status of a cloud instance.
+enum CloudInstanceStatus: String, Codable, CaseIterable, Hashable {
+    case stopped
+    case starting
+    case running
+    case stopping
+    case terminated
+    case unknown
+
+    var displayName: String {
+        rawValue.capitalized
+    }
+
+    var color: String {
+        switch self {
+        case .running: return "green"
+        case .starting, .stopping: return "orange"
+        case .stopped, .terminated: return "red"
+        case .unknown: return "gray"
+        }
+    }
+}
+
+/// SSH connection configuration.
+struct SSHConfig: Codable, Hashable {
+    var host: String = ""
+    var user: String = ""
+    var port: Int = 22
+    var keyPath: String = ""
+}
+
+/// AWS EC2 instance configuration.
+struct EC2Config: Codable, Hashable {
+    var instanceId: String = ""
+    var region: String = "us-east-1"
+    var instanceType: String = "t3.micro"
+    var ami: String = ""
+    var keyPair: String = ""
+    var securityGroup: String = ""
+    var sshUser: String = "ec2-user"
+    var sshKeyPath: String = ""
+}
+
+/// AWS Fargate task configuration.
+struct FargateConfig: Codable, Hashable {
+    var cluster: String = ""
+    var taskDefinition: String = ""
+    var region: String = "us-east-1"
+    var subnets: [String] = []
+    var securityGroups: [String] = []
+    var taskArn: String = ""
+    var containerName: String = ""
+    var sshUser: String = ""
+    var sshKeyPath: String = ""
+}
+
+/// Local Docker container configuration.
+struct DockerConfig: Codable, Hashable {
+    var imageName: String = ""
+    var containerName: String = ""
+    var containerId: String = ""
+    var sshPort: Int = 2222
+    var sshUser: String = "root"
+    var sshKeyPath: String = ""
+    var volumes: [String] = []
+}
+
+/// File sync configuration for a cloud instance.
+struct SyncConfig: Codable, Hashable {
+    var excludes: [String] = SyncConfig.defaultExcludes
+    var remotePath: String = "~/projects"
+
+    static let defaultExcludes: [String] = [
+        "node_modules",
+        ".git",
+        "build",
+        "dist",
+        "__pycache__",
+        ".venv",
+        ".next",
+        ".DS_Store",
+        "*.log",
+        ".env.local",
+    ]
+}
+
+/// A cloud instance (remote machine or container) managed by the app.
+struct CloudInstance: Identifiable, Codable, Hashable {
+    let id: UUID
+    var name: String
+    var type: CloudInstanceType
+    var sshConfig: SSHConfig?
+    var ec2Config: EC2Config?
+    var fargateConfig: FargateConfig?
+    var dockerConfig: DockerConfig?
+    var syncConfig: SyncConfig
+    var pairedProjectIds: [String]
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        type: CloudInstanceType,
+        sshConfig: SSHConfig? = nil,
+        ec2Config: EC2Config? = nil,
+        fargateConfig: FargateConfig? = nil,
+        dockerConfig: DockerConfig? = nil,
+        syncConfig: SyncConfig = SyncConfig(),
+        pairedProjectIds: [String] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.type = type
+        self.sshConfig = sshConfig
+        self.ec2Config = ec2Config
+        self.fargateConfig = fargateConfig
+        self.dockerConfig = dockerConfig
+        self.syncConfig = syncConfig
+        self.pairedProjectIds = pairedProjectIds
+    }
+}
+
+/// Runtime state for a cloud instance (not persisted).
+struct CloudInstanceRuntimeInfo {
+    var status: CloudInstanceStatus = .unknown
+    var publicIP: String? = nil
+    var isSyncing: Bool = false
+    var lastSyncDate: Date? = nil
+    var lastSyncError: String? = nil
+    var tunnelPID: Int32? = nil
 }

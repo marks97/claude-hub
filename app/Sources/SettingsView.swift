@@ -4,6 +4,9 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @State private var newRegistryURL = ""
+    @State private var awsAccessKey = ""
+    @State private var awsSecretKey = ""
+    @State private var keychainStatus: String?
 
     private var previewName: String {
         appState.settings.isolationDisplayName(for: "MyProject")
@@ -51,6 +54,131 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // MARK: - Cloud Defaults
+            Section {
+                HStack {
+                    Text("Default Region")
+                        .frame(width: 120, alignment: .leading)
+                    TextField("us-east-1", text: $appState.settings.awsDefaultRegion)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .onChange(of: appState.settings.awsDefaultRegion) { _, _ in
+                            appState.saveSettings()
+                        }
+                }
+
+                HStack {
+                    Text("Default SSH Key")
+                        .frame(width: 120, alignment: .leading)
+                    TextField("~/.ssh/id_rsa", text: $appState.settings.defaultSSHKeyPath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .onChange(of: appState.settings.defaultSSHKeyPath) { _, _ in
+                            appState.saveSettings()
+                        }
+                    Button {
+                        let panel = NSOpenPanel()
+                        panel.title = "Select SSH Key"
+                        panel.canChooseFiles = true
+                        panel.canChooseDirectories = false
+                        panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory() + "/.ssh")
+                        if panel.runModal() == .OK, let url = panel.url {
+                            appState.settings.defaultSSHKeyPath = url.path
+                            appState.saveSettings()
+                        }
+                    } label: {
+                        Image(systemName: "folder")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                HStack {
+                    Text("Dockerfile Path")
+                        .frame(width: 120, alignment: .leading)
+                    TextField("optional", text: $appState.settings.defaultDockerfilePath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .onChange(of: appState.settings.defaultDockerfilePath) { _, _ in
+                            appState.saveSettings()
+                        }
+                }
+            } header: {
+                Text("Cloud Defaults")
+            } footer: {
+                Text("Default values used when creating new cloud instances.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            // MARK: - AWS Credentials
+            Section {
+                HStack {
+                    Text("Access Key")
+                        .frame(width: 100, alignment: .leading)
+                    SecureField("AKIA...", text: $awsAccessKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                }
+
+                HStack {
+                    Text("Secret Key")
+                        .frame(width: 100, alignment: .leading)
+                    SecureField("secret", text: $awsSecretKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                }
+
+                HStack {
+                    Button("Store in Keychain") {
+                        let ak = awsAccessKey.trimmingCharacters(in: .whitespaces)
+                        let sk = awsSecretKey.trimmingCharacters(in: .whitespaces)
+                        guard !ak.isEmpty, !sk.isEmpty else {
+                            keychainStatus = "Both fields required"
+                            return
+                        }
+                        if appState.saveAWSCredentialsToKeychain(accessKey: ak, secretKey: sk) {
+                            keychainStatus = "Saved to Keychain"
+                            awsAccessKey = ""
+                            awsSecretKey = ""
+                        } else {
+                            keychainStatus = "Failed to save"
+                        }
+                    }
+                    .disabled(awsAccessKey.trimmingCharacters(in: .whitespaces).isEmpty ||
+                              awsSecretKey.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                    Button("Clear from Keychain") {
+                        appState.deleteAWSCredentialsFromKeychain()
+                        keychainStatus = "Removed from Keychain"
+                    }
+
+                    if let status = keychainStatus {
+                        Text(status)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+
+                    Spacer()
+
+                    if appState.loadAWSCredentialsFromKeychain() != nil {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(Theme.green)
+                            Text("Stored")
+                        }
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                    }
+                }
+            } header: {
+                Text("AWS Credentials")
+            } footer: {
+                Text("Stored securely in macOS Keychain. Used as fallback when no project .env has AWS keys.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             // MARK: - Marketplace Sources
             Section {
                 ForEach(appState.settings.registryURLs, id: \.self) { url in
@@ -90,7 +218,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 360)
+        .frame(width: 500, height: 540)
     }
 
     private func addRegistryURL() {

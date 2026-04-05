@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import Security
 import os.log
 
 private let logger = Logger(subsystem: "com.claudehub", category: "AppState")
@@ -21,6 +22,12 @@ class AppState: ObservableObject {
     // Per-project Claude state (used when isolation is ON)
     @Published var projectInstances: [String: ProjectInstanceInfo] = [:]
 
+    // Cloud instances
+    @Published var cloudInstances: [CloudInstance] = []
+    @Published var selectedCloudInstance: CloudInstance?
+    @Published var cloudInstanceRuntimeInfo: [UUID: CloudInstanceRuntimeInfo] = [:]
+    @Published var showingAddCloudInstance = false
+
     var anyProjectRestarting: Bool {
         isRestarting || projectInstances.values.contains { $0.isRestarting }
     }
@@ -28,11 +35,13 @@ class AppState: ObservableObject {
     private let gatewayPath: String
     private var claudePollingTimer: Timer?
     private var lastDesktopConfigWriteDate: Date?
+    private var pollingTickCount: Int = 0
 
     private enum Config {
         static let claudeBundleId = "com.anthropic.claudefordesktop"
         static let userDefaultsKey = "savedProjects"
         static let settingsKey = "appSettings"
+        static let cloudInstancesKey = "savedCloudInstances"
         static let mcpConfigPath = ".claude/infra/.mcp.json"
         static let gatewayConfigPath = ".claude/infra/gateway.config.json"
         static let envFilePath = ".claude/infra/.env"
@@ -43,6 +52,8 @@ class AppState: ObservableObject {
         static let launchPollAttempts = 30
         static let processSettleDelay: TimeInterval = 5.0
         static let toolDiscoveryTimeout: TimeInterval = 15.0
+        static let cloudPollingTicks = 10 // poll cloud instances every 10th tick (~30s)
+        static let awsKeychainService = "com.claudehub.aws"
     }
 
     /// The run-mcp.sh script template. Resolves the user's login shell PATH
@@ -92,6 +103,7 @@ class AppState: ObservableObject {
         loadSettings()
         isClaudeRunning = findClaudeApp() != nil
         loadProjects()
+        loadCloudInstances()
         if let first = projects.first {
             selectedProject = first
             loadServers(for: first)
@@ -124,6 +136,8 @@ class AppState: ObservableObject {
     private func startClaudePolling() {
         claudePollingTimer = Timer.scheduledTimer(withTimeInterval: Config.pollingInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
+
+            self.pollingTickCount += 1
 
             // Global Claude check
             if !self.isRestarting {
@@ -168,6 +182,20 @@ class AppState: ObservableObject {
                 // Ensure tools in session files are enabled
                 // (catches newly created sessions where tools default to disabled)
                 self.enableAllToolsInSessions(settingsDir: self.claudeSettingsDir(for: project))
+            }
+
+            // Cloud instance status polling (every 10th tick, ~30s)
+            if self.pollingTickCount % Config.cloudPollingTicks == 0 {
+                self.pollCloudInstanceStatuses()
+            }
+
+            // Check SSH tunnel liveness
+            for (id, info) in self.cloudInstanceRuntimeInfo {
+                if let pid = info.tunnelPID {
+                    if kill(pid, 0) != 0 {
+                        self.cloudInstanceRuntimeInfo[id]?.tunnelPID = nil
+                    }
+                }
             }
         }
     }
@@ -356,6 +384,24 @@ class AppState: ObservableObject {
         if !fm.fileExists(atPath: claudeMdPath) {
             try? "".write(toFile: claudeMdPath, atomically: true, encoding: .utf8)
         }
+
+        // .claudehubignore — default patterns for file sync exclusion
+        let ignorePath = "\(projectPath)/.claudehubignore"
+        if !fm.fileExists(atPath: ignorePath) {
+            let defaults = [
+                "node_modules",
+                ".git",
+                "build",
+                "dist",
+                "__pycache__",
+                ".venv",
+                ".next",
+                ".DS_Store",
+                "*.log",
+                ".env.local",
+            ].joined(separator: "\n")
+            try? defaults.write(toFile: ignorePath, atomically: true, encoding: .utf8)
+        }
     }
 
     /// Removes a project, terminates its Claude instance if running, cleans up wrapper, and updates selection.
@@ -391,12 +437,79 @@ class AppState: ObservableObject {
     }
 
     func selectProject(_ project: Project) {
+        selectedCloudInstance = nil
         selectedProject = project
         loadServers(for: project)
 
         // Ensure desktop config has our servers, then initialize sync state
         writeDesktopConfig(for: project)
         syncFromDesktopConfig(for: project)
+    }
+
+    // MARK: - Cloud Instance Management
+
+    func loadCloudInstances() {
+        if let data = UserDefaults.standard.data(forKey: Config.cloudInstancesKey),
+           let saved = try? JSONDecoder().decode([CloudInstance].self, from: data) {
+            cloudInstances = saved
+        }
+    }
+
+    func saveCloudInstances() {
+        if let data = try? JSONEncoder().encode(cloudInstances) {
+            UserDefaults.standard.set(data, forKey: Config.cloudInstancesKey)
+        }
+    }
+
+    func addCloudInstance(_ instance: CloudInstance) {
+        cloudInstances.append(instance)
+        saveCloudInstances()
+        selectCloudInstance(instance)
+    }
+
+    func removeCloudInstance(_ instance: CloudInstance) {
+        closeTunnel(for: instance)
+        cloudInstanceRuntimeInfo.removeValue(forKey: instance.id)
+        cloudInstances.removeAll { $0.id == instance.id }
+        saveCloudInstances()
+        if selectedCloudInstance?.id == instance.id {
+            selectedCloudInstance = cloudInstances.first
+        }
+    }
+
+    func updateCloudInstance(_ instance: CloudInstance) {
+        guard let index = cloudInstances.firstIndex(where: { $0.id == instance.id }) else { return }
+        cloudInstances[index] = instance
+        saveCloudInstances()
+        if selectedCloudInstance?.id == instance.id {
+            selectedCloudInstance = cloudInstances[index]
+        }
+    }
+
+    func selectCloudInstance(_ instance: CloudInstance) {
+        selectedProject = nil
+        servers = []
+        selectedCloudInstance = instance
+    }
+
+    func pairProject(_ projectId: String, with instanceId: UUID) {
+        guard let index = cloudInstances.firstIndex(where: { $0.id == instanceId }) else { return }
+        if !cloudInstances[index].pairedProjectIds.contains(projectId) {
+            cloudInstances[index].pairedProjectIds.append(projectId)
+            saveCloudInstances()
+            if selectedCloudInstance?.id == instanceId {
+                selectedCloudInstance = cloudInstances[index]
+            }
+        }
+    }
+
+    func unpairProject(_ projectId: String, from instanceId: UUID) {
+        guard let index = cloudInstances.firstIndex(where: { $0.id == instanceId }) else { return }
+        cloudInstances[index].pairedProjectIds.removeAll { $0 == projectId }
+        saveCloudInstances()
+        if selectedCloudInstance?.id == instanceId {
+            selectedCloudInstance = cloudInstances[index]
+        }
     }
 
     // MARK: - Server Configuration
@@ -443,7 +556,10 @@ class AppState: ObservableObject {
                 tools: tools,
                 command: command,
                 args: args,
-                env: env
+                env: env,
+                serverType: config.type,
+                url: config.url,
+                headersHelper: config.headersHelper
             )
         }.sorted { $0.name < $1.name }
     }
@@ -583,6 +699,10 @@ class AppState: ObservableObject {
             for server in self.servers {
                 guard server.enabled else {
                     logger.info("discoverTools: skipping disabled server \(server.name)")
+                    continue
+                }
+                if server.isHTTP {
+                    logger.info("discoverTools: skipping \(server.name) (HTTP, no stdio discovery)")
                     continue
                 }
 
@@ -767,7 +887,7 @@ class AppState: ObservableObject {
 
         var gatewayServers: [String: GatewayServerConfig] = [:]
 
-        for server in servers {
+        for server in servers where !server.isHTTP {
             let command = resolveCommand(server.command, projectPath: projectPath)
             let toolsFilter: GatewayServerConfig.ToolsFilter
 
@@ -798,18 +918,30 @@ class AppState: ObservableObject {
             try? data.write(to: URL(fileURLWithPath: gatewayConfigPath))
         }
 
-        // One gateway entry per enabled server
+        // One gateway entry per enabled stdio server, HTTP servers go direct
         let nodeCommand = resolveCommand("node", projectPath: projectPath)
         var mcpServerEntries: [String: Any] = [:]
         for server in servers where server.enabled {
-            mcpServerEntries[server.name] = [
-                "command": nodeCommand,
-                "args": ["\(gatewayPath)/index.js"],
-                "env": [
-                    "MCP_GATEWAY_CONFIG": gatewayConfigPath,
-                    "MCP_GATEWAY_SERVER": server.name
+            if server.isHTTP {
+                // HTTP servers bypass the gateway
+                var entry: [String: Any] = [
+                    "type": server.serverType!,
+                    "url": server.url!
                 ]
-            ] as [String: Any]
+                if let helper = server.headersHelper {
+                    entry["headersHelper"] = helper
+                }
+                mcpServerEntries[server.name] = entry
+            } else {
+                mcpServerEntries[server.name] = [
+                    "command": nodeCommand,
+                    "args": ["\(gatewayPath)/index.js"],
+                    "env": [
+                        "MCP_GATEWAY_CONFIG": gatewayConfigPath,
+                        "MCP_GATEWAY_SERVER": server.name
+                    ]
+                ] as [String: Any]
+            }
         }
         let mcpJson: [String: Any] = ["mcpServers": mcpServerEntries]
 
@@ -1446,6 +1578,1109 @@ class AppState: ObservableObject {
             Thread.sleep(forTimeInterval: Config.pollStep)
             if kill(pid, 0) != 0 { return }
         }
+    }
+
+    // MARK: - Cloud Instance Operations
+
+    /// Result of running an external command.
+    struct CommandResult {
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+        var success: Bool { exitCode == 0 }
+    }
+
+    /// Runs an external command and returns the result. Must be called from a background queue.
+    func runCommand(
+        executable: String,
+        arguments: [String],
+        environment: [String: String]? = nil,
+        timeout: TimeInterval = 30
+    ) -> CommandResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        if let env = environment {
+            var merged = ProcessInfo.processInfo.environment
+            for (k, v) in env { merged[k] = v }
+            process.environment = merged
+        }
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            return CommandResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
+        }
+
+        // Read pipes before waitUntilExit to avoid deadlock
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        return CommandResult(
+            exitCode: process.terminationStatus,
+            stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+            stderr: String(data: stderrData, encoding: .utf8) ?? ""
+        )
+    }
+
+    /// Resolves the SSH connection target for any instance type.
+    struct SSHTarget {
+        let user: String
+        let host: String
+        let port: Int
+        let keyPath: String
+    }
+
+    func resolveSSHTarget(for instance: CloudInstance) -> SSHTarget? {
+        switch instance.type {
+        case .ssh:
+            guard let config = instance.sshConfig, !config.host.isEmpty else { return nil }
+            return SSHTarget(user: config.user, host: config.host, port: config.port, keyPath: config.keyPath)
+        case .ec2:
+            guard let config = instance.ec2Config else { return nil }
+            let ip = cloudInstanceRuntimeInfo[instance.id]?.publicIP ?? ""
+            guard !ip.isEmpty else { return nil }
+            return SSHTarget(user: config.sshUser, host: ip, port: 22, keyPath: config.sshKeyPath)
+        case .fargate:
+            guard let config = instance.fargateConfig else { return nil }
+            let ip = cloudInstanceRuntimeInfo[instance.id]?.publicIP ?? ""
+            guard !ip.isEmpty else { return nil }
+            return SSHTarget(user: config.sshUser, host: ip, port: 22, keyPath: config.sshKeyPath)
+        case .docker:
+            guard let config = instance.dockerConfig else { return nil }
+            return SSHTarget(user: config.sshUser, host: "localhost", port: config.sshPort, keyPath: config.sshKeyPath)
+        }
+    }
+
+    /// Builds the full SSH command string for display/copy.
+    func sshCommandString(for instance: CloudInstance) -> String? {
+        guard let target = resolveSSHTarget(for: instance) else { return nil }
+        var parts = ["ssh"]
+        if target.port != 22 { parts += ["-p", "\(target.port)"] }
+        if !target.keyPath.isEmpty { parts += ["-i", target.keyPath] }
+        let userHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+        parts.append(userHost)
+        return parts.joined(separator: " ")
+    }
+
+    /// Resolves AWS environment variables for CLI commands.
+    func resolveAWSEnvironment(for instance: CloudInstance) -> [String: String] {
+        var env: [String: String] = [:]
+
+        // Determine region
+        let region: String
+        switch instance.type {
+        case .ec2: region = instance.ec2Config?.region ?? settings.awsDefaultRegion
+        case .fargate: region = instance.fargateConfig?.region ?? settings.awsDefaultRegion
+        default: region = settings.awsDefaultRegion
+        }
+        env["AWS_DEFAULT_REGION"] = region
+
+        // Check paired project .env files for AWS keys
+        for projectId in instance.pairedProjectIds {
+            let envPath = "\(projectId)/\(Config.envFilePath)"
+            if let contents = try? String(contentsOfFile: envPath, encoding: .utf8) {
+                for line in contents.components(separatedBy: .newlines) {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.hasPrefix("#"), trimmed.contains("=") else { continue }
+                    let parts = trimmed.split(separator: "=", maxSplits: 1)
+                    guard parts.count == 2 else { continue }
+                    let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
+                    let value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                    if key == "AWS_ACCESS_KEY_ID" || key == "AWS_SECRET_ACCESS_KEY" || key == "AWS_SESSION_TOKEN" {
+                        env[key] = value
+                    }
+                }
+            }
+            if env["AWS_ACCESS_KEY_ID"] != nil { break }
+        }
+
+        // Fall back to Keychain if no keys found in .env
+        if env["AWS_ACCESS_KEY_ID"] == nil {
+            if let creds = loadAWSCredentialsFromKeychain() {
+                env["AWS_ACCESS_KEY_ID"] = creds.accessKey
+                env["AWS_SECRET_ACCESS_KEY"] = creds.secretKey
+            }
+        }
+
+        // If still no keys, let aws CLI use ~/.aws/credentials (don't set anything)
+        return env
+    }
+
+    // MARK: - SSH Connection Test
+
+    func testSSHConnection(for instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let target = resolveSSHTarget(for: instance) else {
+            completion(false, "No SSH target configured")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            var args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new"]
+            if target.port != 22 { args += ["-p", "\(target.port)"] }
+            if !target.keyPath.isEmpty {
+                args += ["-i", (target.keyPath as NSString).expandingTildeInPath]
+            }
+            let userHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+            args += [userHost, "echo", "ok"]
+
+            let result = self.runCommand(executable: "/usr/bin/ssh", arguments: args, timeout: 10)
+            DispatchQueue.main.async {
+                if result.success {
+                    completion(true, "Connected successfully")
+                } else {
+                    completion(false, result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        }
+    }
+
+    // MARK: - EC2 Operations
+
+    func ec2Describe(_ instance: CloudInstance, completion: @escaping (CloudInstanceStatus, String?) -> Void) {
+        guard let config = instance.ec2Config, !config.instanceId.isEmpty else {
+            completion(.unknown, nil)
+            return
+        }
+        let env = resolveAWSEnvironment(for: instance)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/aws",
+                arguments: ["ec2", "describe-instances", "--instance-ids", config.instanceId, "--region", config.region, "--output", "json"],
+                environment: env
+            )
+            var status: CloudInstanceStatus = .unknown
+            var ip: String?
+            if result.success, let data = result.stdout.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let reservations = json["Reservations"] as? [[String: Any]],
+               let instances = reservations.first?["Instances"] as? [[String: Any]],
+               let inst = instances.first {
+                if let state = inst["State"] as? [String: Any], let name = state["Name"] as? String {
+                    switch name {
+                    case "running": status = .running
+                    case "stopped": status = .stopped
+                    case "pending": status = .starting
+                    case "stopping": status = .stopping
+                    case "terminated", "shutting-down": status = .terminated
+                    default: status = .unknown
+                    }
+                }
+                ip = inst["PublicIpAddress"] as? String
+            }
+            DispatchQueue.main.async {
+                completion(status, ip)
+            }
+        }
+    }
+
+    func ec2Start(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.ec2Config, !config.instanceId.isEmpty else {
+            completion(false, "No instance ID configured")
+            return
+        }
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .starting)
+        let env = resolveAWSEnvironment(for: instance)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/aws",
+                arguments: ["ec2", "start-instances", "--instance-ids", config.instanceId, "--region", config.region],
+                environment: env
+            )
+            DispatchQueue.main.async {
+                completion(result.success, result.success ? "Instance starting" : result.stderr)
+            }
+        }
+    }
+
+    func ec2Stop(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.ec2Config, !config.instanceId.isEmpty else {
+            completion(false, "No instance ID configured")
+            return
+        }
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .stopping)
+        let env = resolveAWSEnvironment(for: instance)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/aws",
+                arguments: ["ec2", "stop-instances", "--instance-ids", config.instanceId, "--region", config.region],
+                environment: env
+            )
+            DispatchQueue.main.async {
+                completion(result.success, result.success ? "Instance stopping" : result.stderr)
+            }
+        }
+    }
+
+    func ec2Terminate(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.ec2Config, !config.instanceId.isEmpty else {
+            completion(false, "No instance ID configured")
+            return
+        }
+        closeTunnel(for: instance)
+        let env = resolveAWSEnvironment(for: instance)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/aws",
+                arguments: ["ec2", "terminate-instances", "--instance-ids", config.instanceId, "--region", config.region],
+                environment: env
+            )
+            DispatchQueue.main.async {
+                if result.success {
+                    self.cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .terminated)
+                }
+                completion(result.success, result.success ? "Instance terminating" : result.stderr)
+            }
+        }
+    }
+
+    // MARK: - Fargate Operations
+
+    func fargateDescribe(_ instance: CloudInstance, completion: @escaping (CloudInstanceStatus, String?) -> Void) {
+        guard let config = instance.fargateConfig, !config.taskArn.isEmpty else {
+            completion(.unknown, nil)
+            return
+        }
+        let env = resolveAWSEnvironment(for: instance)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/aws",
+                arguments: ["ecs", "describe-tasks", "--cluster", config.cluster, "--tasks", config.taskArn, "--region", config.region, "--output", "json"],
+                environment: env
+            )
+            var status: CloudInstanceStatus = .unknown
+            var ip: String?
+            if result.success, let data = result.stdout.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tasks = json["tasks"] as? [[String: Any]],
+               let task = tasks.first {
+                if let lastStatus = task["lastStatus"] as? String {
+                    switch lastStatus {
+                    case "RUNNING": status = .running
+                    case "PROVISIONING", "PENDING", "ACTIVATING": status = .starting
+                    case "DEPROVISIONING", "STOPPING": status = .stopping
+                    case "STOPPED": status = .stopped
+                    default: status = .unknown
+                    }
+                }
+                // Extract public IP from network attachments
+                if let attachments = task["attachments"] as? [[String: Any]] {
+                    for attachment in attachments {
+                        if let details = attachment["details"] as? [[String: Any]] {
+                            for detail in details {
+                                if detail["name"] as? String == "networkInterfaceId",
+                                   let _ = detail["value"] as? String {
+                                    // IP comes from ENI — for now just check containers
+                                }
+                            }
+                        }
+                    }
+                }
+                if let containers = task["containers"] as? [[String: Any]],
+                   let container = containers.first,
+                   let networkInterfaces = container["networkInterfaces"] as? [[String: Any]],
+                   let ni = networkInterfaces.first {
+                    ip = ni["privateIpv4Address"] as? String
+                }
+            }
+            DispatchQueue.main.async {
+                completion(status, ip)
+            }
+        }
+    }
+
+    func fargateRunTask(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.fargateConfig, !config.cluster.isEmpty, !config.taskDefinition.isEmpty else {
+            completion(false, "Cluster and task definition required")
+            return
+        }
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .starting)
+        let env = resolveAWSEnvironment(for: instance)
+
+        var args = ["ecs", "run-task",
+                    "--cluster", config.cluster,
+                    "--task-definition", config.taskDefinition,
+                    "--region", config.region,
+                    "--launch-type", "FARGATE",
+                    "--output", "json"]
+
+        if !config.subnets.isEmpty || !config.securityGroups.isEmpty {
+            let subnetsStr = config.subnets.joined(separator: ",")
+            let sgStr = config.securityGroups.joined(separator: ",")
+            var netConfig = "awsvpcConfiguration={subnets=[\(subnetsStr)]"
+            if !sgStr.isEmpty {
+                netConfig += ",securityGroups=[\(sgStr)]"
+            }
+            netConfig += ",assignPublicIp=ENABLED}"
+            args += ["--network-configuration", netConfig]
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(executable: "/usr/local/bin/aws", arguments: args, environment: env)
+
+            var taskArn: String?
+            if result.success, let data = result.stdout.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tasks = json["tasks"] as? [[String: Any]],
+               let task = tasks.first {
+                taskArn = task["taskArn"] as? String
+            }
+
+            DispatchQueue.main.async {
+                if let arn = taskArn {
+                    // Update the instance's task ARN
+                    if let index = self.cloudInstances.firstIndex(where: { $0.id == instance.id }) {
+                        self.cloudInstances[index].fargateConfig?.taskArn = arn
+                        self.saveCloudInstances()
+                        if self.selectedCloudInstance?.id == instance.id {
+                            self.selectedCloudInstance = self.cloudInstances[index]
+                        }
+                    }
+                }
+                completion(result.success, result.success ? "Task starting" : result.stderr)
+            }
+        }
+    }
+
+    func fargateStopTask(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.fargateConfig, !config.taskArn.isEmpty else {
+            completion(false, "No task ARN")
+            return
+        }
+        closeTunnel(for: instance)
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .stopping)
+        let env = resolveAWSEnvironment(for: instance)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/aws",
+                arguments: ["ecs", "stop-task", "--cluster", config.cluster, "--task", config.taskArn, "--region", config.region],
+                environment: env
+            )
+            DispatchQueue.main.async {
+                completion(result.success, result.success ? "Task stopping" : result.stderr)
+            }
+        }
+    }
+
+    // MARK: - Docker Operations
+
+    func dockerInspect(_ instance: CloudInstance, completion: @escaping (CloudInstanceStatus) -> Void) {
+        guard let config = instance.dockerConfig, !config.containerId.isEmpty else {
+            completion(.unknown)
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(
+                executable: "/usr/local/bin/docker",
+                arguments: ["inspect", "--format", "{{.State.Status}}", config.containerId]
+            )
+            var status: CloudInstanceStatus = .unknown
+            if result.success {
+                let state = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                switch state {
+                case "running": status = .running
+                case "created", "restarting": status = .starting
+                case "paused", "exited", "dead": status = .stopped
+                default: status = .unknown
+                }
+            }
+            DispatchQueue.main.async {
+                completion(status)
+            }
+        }
+    }
+
+    func dockerRun(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.dockerConfig, !config.imageName.isEmpty else {
+            completion(false, "Image name required")
+            return
+        }
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .starting)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            var args = ["run", "-d", "-p", "\(config.sshPort):22"]
+            if !config.containerName.isEmpty {
+                args += ["--name", config.containerName]
+            }
+            for vol in config.volumes where !vol.isEmpty {
+                args += ["-v", vol]
+            }
+            args.append(config.imageName)
+
+            let result = self.runCommand(executable: "/usr/local/bin/docker", arguments: args)
+
+            DispatchQueue.main.async {
+                if result.success {
+                    let containerId = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let index = self.cloudInstances.firstIndex(where: { $0.id == instance.id }) {
+                        self.cloudInstances[index].dockerConfig?.containerId = String(containerId.prefix(12))
+                        self.saveCloudInstances()
+                        self.cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .running)
+                        if self.selectedCloudInstance?.id == instance.id {
+                            self.selectedCloudInstance = self.cloudInstances[index]
+                        }
+                    }
+                }
+                completion(result.success, result.success ? "Container started" : result.stderr)
+            }
+        }
+    }
+
+    func dockerStart(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.dockerConfig, !config.containerId.isEmpty else {
+            completion(false, "No container ID")
+            return
+        }
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .starting)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(executable: "/usr/local/bin/docker", arguments: ["start", config.containerId])
+            DispatchQueue.main.async {
+                if result.success {
+                    self.cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .running)
+                }
+                completion(result.success, result.success ? "Container started" : result.stderr)
+            }
+        }
+    }
+
+    func dockerStop(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.dockerConfig, !config.containerId.isEmpty else {
+            completion(false, "No container ID")
+            return
+        }
+        closeTunnel(for: instance)
+        cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .stopping)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(executable: "/usr/local/bin/docker", arguments: ["stop", config.containerId])
+            DispatchQueue.main.async {
+                if result.success {
+                    self.cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .stopped)
+                }
+                completion(result.success, result.success ? "Container stopped" : result.stderr)
+            }
+        }
+    }
+
+    func dockerRemove(_ instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let config = instance.dockerConfig, !config.containerId.isEmpty else {
+            completion(false, "No container ID")
+            return
+        }
+        closeTunnel(for: instance)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runCommand(executable: "/usr/local/bin/docker", arguments: ["rm", "-f", config.containerId])
+            DispatchQueue.main.async {
+                if result.success {
+                    self.cloudInstanceRuntimeInfo[instance.id] = CloudInstanceRuntimeInfo(status: .terminated)
+                }
+                completion(result.success, result.success ? "Container removed" : result.stderr)
+            }
+        }
+    }
+
+    // MARK: - SSH Tunnel Management
+
+    func openTunnel(for instance: CloudInstance, completion: @escaping (Bool, String) -> Void) {
+        guard let target = resolveSSHTarget(for: instance) else {
+            completion(false, "Cannot resolve SSH target")
+            return
+        }
+
+        // Close existing tunnel first
+        closeTunnel(for: instance)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            var args = [
+                "-L", "6080:localhost:6080",
+                "-L", "2222:localhost:22",
+                "-N", "-f",
+                "-o", "ExitOnForwardFailure=yes",
+                "-o", "ServerAliveInterval=30",
+                "-o", "StrictHostKeyChecking=accept-new",
+            ]
+            if target.port != 22 { args += ["-p", "\(target.port)"] }
+            if !target.keyPath.isEmpty {
+                args += ["-i", (target.keyPath as NSString).expandingTildeInPath]
+            }
+            let userHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+            args.append(userHost)
+
+            let result = self.runCommand(executable: "/usr/bin/ssh", arguments: args, timeout: 15)
+
+            // Find the SSH tunnel PID
+            let pgrepResult = self.runCommand(
+                executable: "/usr/bin/pgrep",
+                arguments: ["-f", "ssh.*-L.*6080.*\(target.host)"]
+            )
+            let pid = Int32(pgrepResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n").first ?? "")
+
+            DispatchQueue.main.async {
+                if result.success || pid != nil {
+                    self.cloudInstanceRuntimeInfo[instance.id]?.tunnelPID = pid
+                    completion(true, "Tunnel opened")
+                } else {
+                    completion(false, result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        }
+    }
+
+    func closeTunnel(for instance: CloudInstance) {
+        guard let pid = cloudInstanceRuntimeInfo[instance.id]?.tunnelPID else { return }
+        kill(pid, SIGTERM)
+        cloudInstanceRuntimeInfo[instance.id]?.tunnelPID = nil
+    }
+
+    var isTunnelOpen: Bool {
+        guard let instance = selectedCloudInstance,
+              let pid = cloudInstanceRuntimeInfo[instance.id]?.tunnelPID else { return false }
+        return kill(pid, 0) == 0
+    }
+
+    // MARK: - Cloud Status Polling
+
+    private func pollCloudInstanceStatuses() {
+        for instance in cloudInstances {
+            let info = cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+            // Skip instances in transitional states (being acted on)
+            if info.status == .starting || info.status == .stopping { continue }
+
+            switch instance.type {
+            case .ssh:
+                // SSH instances don't have a lifecycle to poll — just verify connectivity if marked running
+                break
+            case .ec2:
+                guard let config = instance.ec2Config, !config.instanceId.isEmpty else { continue }
+                ec2Describe(instance) { [weak self] status, ip in
+                    guard let self else { return }
+                    var updated = self.cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+                    updated.status = status
+                    updated.publicIP = ip
+                    self.cloudInstanceRuntimeInfo[instance.id] = updated
+                }
+            case .fargate:
+                guard let config = instance.fargateConfig, !config.taskArn.isEmpty else { continue }
+                fargateDescribe(instance) { [weak self] status, ip in
+                    guard let self else { return }
+                    var updated = self.cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+                    updated.status = status
+                    updated.publicIP = ip
+                    self.cloudInstanceRuntimeInfo[instance.id] = updated
+                }
+            case .docker:
+                guard let config = instance.dockerConfig, !config.containerId.isEmpty else { continue }
+                dockerInspect(instance) { [weak self] status in
+                    guard let self else { return }
+                    var updated = self.cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+                    updated.status = status
+                    self.cloudInstanceRuntimeInfo[instance.id] = updated
+                }
+            }
+        }
+    }
+
+    // MARK: - Rsync Project Sync
+
+    enum SyncDirection {
+        case push // local to remote
+        case pull // remote to local
+    }
+
+    /// Builds the rsync argument list for syncing a project to/from an instance.
+    func buildRsyncArgs(project: Project, instance: CloudInstance, direction: SyncDirection) -> [String]? {
+        guard let target = resolveSSHTarget(for: instance) else { return nil }
+
+        let remotePath = instance.syncConfig.remotePath
+        let remoteDir = "\(remotePath)/\(project.name)/"
+
+        // Build SSH transport string
+        var sshCmd = "ssh"
+        if target.port != 22 { sshCmd += " -p \(target.port)" }
+        if !target.keyPath.isEmpty {
+            sshCmd += " -i \((target.keyPath as NSString).expandingTildeInPath)"
+        }
+        sshCmd += " -o StrictHostKeyChecking=accept-new"
+
+        let userHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+
+        var args = ["-avz", "--delete", "-e", sshCmd]
+
+        // Add .claudehubignore if it exists
+        let ignorePath = "\(project.path)/.claudehubignore"
+        if FileManager.default.fileExists(atPath: ignorePath) {
+            args += ["--exclude-from", ignorePath]
+        }
+
+        // Add per-instance SyncConfig excludes
+        for exclude in instance.syncConfig.excludes {
+            args += ["--exclude", exclude]
+        }
+
+        switch direction {
+        case .push:
+            args.append("\(project.path)/")
+            args.append("\(userHost):\(remoteDir)")
+        case .pull:
+            args.append("\(userHost):\(remoteDir)")
+            args.append("\(project.path)/")
+        }
+
+        return args
+    }
+
+    /// Syncs a project to/from a cloud instance using rsync.
+    func syncProject(_ project: Project, to instance: CloudInstance, direction: SyncDirection, completion: @escaping (Bool, String) -> Void) {
+        guard let args = buildRsyncArgs(project: project, instance: instance, direction: direction) else {
+            completion(false, "Cannot resolve SSH target")
+            return
+        }
+
+        // Mark syncing
+        var info = cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+        info.isSyncing = true
+        cloudInstanceRuntimeInfo[instance.id] = info
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            // Ensure remote directory exists for push
+            if direction == .push, let target = self.resolveSSHTarget(for: instance) {
+                let remotePath = instance.syncConfig.remotePath
+                let remoteDir = "\(remotePath)/\(project.name)"
+                let userHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+                var mkdirSSHArgs = ["-o", "StrictHostKeyChecking=accept-new"]
+                if target.port != 22 { mkdirSSHArgs += ["-p", "\(target.port)"] }
+                if !target.keyPath.isEmpty {
+                    mkdirSSHArgs += ["-i", (target.keyPath as NSString).expandingTildeInPath]
+                }
+                mkdirSSHArgs += [userHost, "mkdir", "-p", remoteDir]
+                _ = self.runCommand(executable: "/usr/bin/ssh", arguments: mkdirSSHArgs)
+            }
+
+            let result = self.runCommand(executable: "/usr/bin/rsync", arguments: args, timeout: 300)
+
+            DispatchQueue.main.async {
+                var updatedInfo = self.cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+                updatedInfo.isSyncing = false
+                if result.success {
+                    updatedInfo.lastSyncDate = Date()
+                    updatedInfo.lastSyncError = nil
+                } else {
+                    updatedInfo.lastSyncError = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                self.cloudInstanceRuntimeInfo[instance.id] = updatedInfo
+                completion(result.success, result.success ? "Sync complete" : result.stderr)
+            }
+        }
+    }
+
+    // MARK: - Claude Desktop for Cloud Instance
+
+    /// Settings directory for a cloud instance.
+    func cloudSettingsDir(for instance: CloudInstance) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let safeName = instance.name
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+        return "\(home)/claude-cloud-\(safeName)"
+    }
+
+    /// Generates ssh_configs.json content for Claude Desktop.
+    func generateSSHConfigsJSON(for instance: CloudInstance) -> Data? {
+        guard let target = resolveSSHTarget(for: instance) else { return nil }
+
+        let sshHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+        let trustedHost = "\(sshHost):\(target.port)"
+
+        var config: [String: Any] = [
+            "id": instance.id.uuidString,
+            "name": instance.name,
+            "sshHost": sshHost,
+            "sshPort": target.port,
+        ]
+        if !target.keyPath.isEmpty {
+            config["sshIdentityFile"] = (target.keyPath as NSString).expandingTildeInPath
+        }
+
+        let root: [String: Any] = [
+            "configs": [config],
+            "trustedHosts": [trustedHost],
+        ]
+
+        return try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    /// Launches Claude Desktop with SSH connection pre-configured for a cloud instance.
+    func launchClaudeForCloudInstance(_ instance: CloudInstance, project: Project? = nil) {
+        let settingsDir = cloudSettingsDir(for: instance)
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: settingsDir, withIntermediateDirectories: true)
+
+        // Write ssh_configs.json
+        if let sshData = generateSSHConfigsJSON(for: instance) {
+            let sshConfigPath = "\(settingsDir)/ssh_configs.json"
+            try? sshData.write(to: URL(fileURLWithPath: sshConfigPath))
+        }
+
+        // Write claude_desktop_config.json with MCP servers if project specified
+        if let project = project {
+            writeCloudDesktopConfig(for: project, settingsDir: settingsDir)
+        }
+
+        // Build wrapper app
+        let wrapperApp = buildCloudWrapperApp(for: instance, settingsDir: settingsDir)
+
+        // Launch
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            process.arguments = ["-a", wrapperApp]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try? process.run()
+            process.waitUntilExit()
+        }
+    }
+
+    /// Writes claude_desktop_config.json for a cloud instance + project.
+    private func writeCloudDesktopConfig(for project: Project, settingsDir: String) {
+        let configPath = "\(settingsDir)/claude_desktop_config.json"
+        let projectPath = project.path.hasSuffix("/") ? String(project.path.dropLast()) : project.path
+        let gatewayConfigPath = "\(projectPath)/\(Config.gatewayConfigPath)"
+        let nodeCommand = resolveCommand("node", projectPath: projectPath)
+
+        var mcpServers: [String: Any] = [:]
+        for server in servers where server.enabled {
+            mcpServers[server.name] = [
+                "command": nodeCommand,
+                "args": ["\(gatewayPath)/index.js"],
+                "env": [
+                    "MCP_GATEWAY_CONFIG": gatewayConfigPath,
+                    "MCP_GATEWAY_SERVER": server.name,
+                ],
+            ] as [String: Any]
+        }
+
+        let config: [String: Any] = ["mcpServers": mcpServers]
+        if let data = try? JSONSerialization.data(
+            withJSONObject: config,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) {
+            try? data.write(to: URL(fileURLWithPath: configPath))
+        }
+    }
+
+    /// Builds a wrapper .app for a cloud instance (analogous to buildWrapperApp for projects).
+    private func buildCloudWrapperApp(for instance: CloudInstance, settingsDir: String) -> String {
+        let displayName = "Claude Cloud - \(instance.name)"
+        let appDir = "\(Self.wrappersDir)/\(displayName).app"
+        let contentsDir = "\(appDir)/Contents"
+        let macosDir = "\(contentsDir)/MacOS"
+        let resourcesDir = "\(contentsDir)/Resources"
+        let fm = FileManager.default
+
+        try? fm.createDirectory(atPath: macosDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: resourcesDir, withIntermediateDirectories: true)
+
+        // Info.plist
+        let bundleId = "com.claudehub.cloud.\(instance.name.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        let plist: [String: Any] = [
+            "CFBundleName": displayName,
+            "CFBundleDisplayName": displayName,
+            "CFBundleIdentifier": bundleId,
+            "CFBundleExecutable": "Claude",
+            "CFBundleIconFile": "AppIcon",
+            "CFBundlePackageType": "APPL",
+            "CFBundleVersion": "\(Int(Date().timeIntervalSince1970))",
+            "CFBundleShortVersionString": "1.0",
+            "LSUIElement": false,
+        ]
+        (plist as NSDictionary).write(toFile: "\(contentsDir)/Info.plist", atomically: true)
+
+        // Launcher
+        let claudeApp = "/Applications/Claude.app"
+        let claudeContents = "\(claudeApp)/Contents"
+        let claudePath = Bundle(path: claudeApp)?.executablePath
+            ?? "\(claudeContents)/MacOS/Claude"
+
+        let launcherSrc = """
+        #include <unistd.h>
+        int main(int argc, char *argv[]) {
+            char *args[] = {"\(claudePath)", "--user-data-dir=\(settingsDir)", 0};
+            return execv("\(claudePath)", args);
+        }
+        """
+        let srcPath = "\(macosDir)/launcher.c"
+        let binPath = "\(macosDir)/Claude"
+        try? launcherSrc.write(toFile: srcPath, atomically: true, encoding: .utf8)
+
+        let needsCompile: Bool
+        if fm.fileExists(atPath: binPath),
+           let srcDate = (try? fm.attributesOfItem(atPath: srcPath))?[.modificationDate] as? Date,
+           let binDate = (try? fm.attributesOfItem(atPath: binPath))?[.modificationDate] as? Date,
+           binDate > srcDate {
+            needsCompile = false
+        } else {
+            needsCompile = true
+        }
+
+        if needsCompile {
+            try? fm.removeItem(atPath: binPath)
+            let cc = Process()
+            cc.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
+            cc.arguments = ["-O2", "-o", binPath, srcPath]
+            cc.standardOutput = FileHandle.nullDevice
+            cc.standardError = FileHandle.nullDevice
+            if (try? cc.run()) != nil { cc.waitUntilExit() }
+        }
+
+        // Copy Claude icon
+        let iconDest = "\(resourcesDir)/AppIcon.icns"
+        if !fm.fileExists(atPath: iconDest) {
+            let candidates = [
+                "\(claudeContents)/Resources/AppIcon.icns",
+                "\(claudeContents)/Resources/icon.icns",
+                "\(claudeContents)/Resources/electron.icns",
+            ]
+            for candidate in candidates {
+                if fm.fileExists(atPath: candidate) {
+                    try? fm.copyItem(atPath: candidate, toPath: iconDest)
+                    break
+                }
+            }
+        }
+
+        return appDir
+    }
+
+    // MARK: - Automation Discovery & Deployment
+
+    /// A discovered scheduled task from ~/.claude/scheduled-tasks/.
+    struct ScheduledTask: Identifiable {
+        var id: String { name }
+        let name: String
+        let description: String
+        let filePath: String
+    }
+
+    /// Discovers available SKILL.md files from ~/.claude/scheduled-tasks/.
+    func discoverScheduledTasks() -> [ScheduledTask] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let tasksDir = "\(home)/.claude/scheduled-tasks"
+        let fm = FileManager.default
+
+        guard let taskDirs = try? fm.contentsOfDirectory(atPath: tasksDir) else { return [] }
+
+        var tasks: [ScheduledTask] = []
+        for dir in taskDirs {
+            let skillPath = "\(tasksDir)/\(dir)/SKILL.md"
+            guard fm.fileExists(atPath: skillPath) else { continue }
+            guard let content = try? String(contentsOfFile: skillPath, encoding: .utf8) else { continue }
+
+            // Parse YAML frontmatter
+            var name = dir
+            var description = ""
+            if content.hasPrefix("---") {
+                let parts = content.components(separatedBy: "---")
+                if parts.count >= 3 {
+                    let frontmatter = parts[1]
+                    for line in frontmatter.components(separatedBy: .newlines) {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        if trimmed.hasPrefix("name:") {
+                            name = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        } else if trimmed.hasPrefix("description:") {
+                            description = String(trimmed.dropFirst(12)).trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                }
+            }
+
+            tasks.append(ScheduledTask(name: name, description: description, filePath: skillPath))
+        }
+        return tasks
+    }
+
+    /// Builds a crontab entry for a scheduled task.
+    func buildCrontabEntry(task: ScheduledTask, cronExpression: String, remotePath: String, projectName: String) -> String {
+        let taskDir = (task.filePath as NSString).deletingLastPathComponent
+        let taskName = (taskDir as NSString).lastPathComponent
+        let skillPath = "~/.claude/scheduled-tasks/\(taskName)/SKILL.md"
+        return "\(cronExpression) cd \(remotePath)/\(projectName) && claude -p \"$(cat \(skillPath))\" --permission-mode dontAsk --max-turns 50"
+    }
+
+    /// Deploys automation tasks to a remote instance.
+    func deployAutomations(
+        to instance: CloudInstance,
+        tasks: [(task: ScheduledTask, cronExpression: String)],
+        projectName: String,
+        completion: @escaping (Bool, String) -> Void
+    ) {
+        guard let target = resolveSSHTarget(for: instance) else {
+            completion(false, "Cannot resolve SSH target")
+            return
+        }
+        guard !tasks.isEmpty else {
+            completion(false, "No tasks selected")
+            return
+        }
+
+        let remotePath = instance.syncConfig.remotePath
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            // Step 1: Sync scheduled-tasks directory to remote
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let tasksDir = "\(home)/.claude/scheduled-tasks/"
+            let userHost = target.user.isEmpty ? target.host : "\(target.user)@\(target.host)"
+
+            var sshCmd = "ssh -o StrictHostKeyChecking=accept-new"
+            if target.port != 22 { sshCmd += " -p \(target.port)" }
+            if !target.keyPath.isEmpty {
+                sshCmd += " -i \((target.keyPath as NSString).expandingTildeInPath)"
+            }
+
+            // Ensure remote dir exists
+            var mkdirArgs = ["-o", "StrictHostKeyChecking=accept-new"]
+            if target.port != 22 { mkdirArgs += ["-p", "\(target.port)"] }
+            if !target.keyPath.isEmpty {
+                mkdirArgs += ["-i", (target.keyPath as NSString).expandingTildeInPath]
+            }
+            mkdirArgs += [userHost, "mkdir", "-p", "~/.claude/scheduled-tasks"]
+            _ = self.runCommand(executable: "/usr/bin/ssh", arguments: mkdirArgs)
+
+            // Sync task files
+            if FileManager.default.fileExists(atPath: tasksDir) {
+                let rsyncArgs = ["-avz", "-e", sshCmd, tasksDir, "\(userHost):~/.claude/scheduled-tasks/"]
+                _ = self.runCommand(executable: "/usr/bin/rsync", arguments: rsyncArgs, timeout: 60)
+            }
+
+            // Step 2: Build crontab content
+            var crontabLines: [String] = [
+                "# Claude Hub automated tasks - deployed \(ISO8601DateFormatter().string(from: Date()))",
+                "SHELL=/bin/bash",
+                "PATH=/usr/local/bin:/usr/bin:/bin",
+                "",
+            ]
+            for entry in tasks {
+                let line = self.buildCrontabEntry(
+                    task: entry.task,
+                    cronExpression: entry.cronExpression,
+                    remotePath: remotePath,
+                    projectName: projectName
+                )
+                crontabLines.append(line)
+            }
+            let crontabContent = crontabLines.joined(separator: "\n") + "\n"
+
+            // Step 3: Install crontab via SSH
+            // Write to temp file locally, pipe to remote crontab
+            let tempFile = NSTemporaryDirectory() + "claudehub_crontab_\(UUID().uuidString)"
+            try? crontabContent.write(toFile: tempFile, atomically: true, encoding: .utf8)
+
+            var sshArgs = ["-o", "StrictHostKeyChecking=accept-new"]
+            if target.port != 22 { sshArgs += ["-p", "\(target.port)"] }
+            if !target.keyPath.isEmpty {
+                sshArgs += ["-i", (target.keyPath as NSString).expandingTildeInPath]
+            }
+            sshArgs += [userHost, "crontab", "-"]
+
+            // Use bash to pipe file into ssh
+            let bashResult = self.runCommand(
+                executable: "/bin/bash",
+                arguments: ["-c", "cat '\(tempFile)' | ssh \(sshArgs.map { "'\($0)'" }.joined(separator: " "))"],
+                timeout: 30
+            )
+
+            try? FileManager.default.removeItem(atPath: tempFile)
+
+            DispatchQueue.main.async {
+                completion(bashResult.success, bashResult.success ? "Automations deployed" : bashResult.stderr)
+            }
+        }
+    }
+
+    /// Returns paired cloud instances for a given project.
+    func cloudInstancesForProject(_ project: Project) -> [CloudInstance] {
+        cloudInstances.filter { $0.pairedProjectIds.contains(project.id) }
+    }
+
+    // MARK: - AWS Keychain
+
+    func saveAWSCredentialsToKeychain(accessKey: String, secretKey: String) -> Bool {
+        let credentials = "\(accessKey):\(secretKey)"
+        guard let data = credentials.data(using: .utf8) else { return false }
+
+        // Delete existing
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Config.awsKeychainService,
+            kSecAttrAccount as String: "default",
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Config.awsKeychainService,
+            kSecAttrAccount as String: "default",
+            kSecValueData as String: data,
+        ]
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    struct AWSCredentials {
+        let accessKey: String
+        let secretKey: String
+    }
+
+    func loadAWSCredentialsFromKeychain() -> AWSCredentials? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Config.awsKeychainService,
+            kSecAttrAccount as String: "default",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let str = String(data: data, encoding: .utf8) else { return nil }
+
+        let parts = str.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        return AWSCredentials(accessKey: String(parts[0]), secretKey: String(parts[1]))
+    }
+
+    func deleteAWSCredentialsFromKeychain() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Config.awsKeychainService,
+            kSecAttrAccount as String: "default",
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
     // MARK: - Utilities

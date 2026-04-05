@@ -6,7 +6,9 @@ struct DetailView: View {
 
     var body: some View {
         Group {
-            if let project = appState.selectedProject {
+            if let instance = appState.selectedCloudInstance {
+                CloudInstanceDetailView(instance: instance)
+            } else if let project = appState.selectedProject {
                 ProjectDetailView(project: project)
             } else {
                 EmptyDetailView()
@@ -142,6 +144,93 @@ struct ProjectDetailView: View {
                 )
             }
             .buttonStyle(.plain)
+
+            // Cloud instance actions (only if paired)
+            cloudActionButtons
+        }
+    }
+
+    @ViewBuilder
+    private var cloudActionButtons: some View {
+        let paired = appState.cloudInstancesForProject(project)
+        if !paired.isEmpty {
+            if paired.count == 1, let inst = paired.first {
+                Button {
+                    appState.syncProject(project, to: inst, direction: .push) { _, _ in }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.circle")
+                        Text("Deploy")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.green)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.green.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.smallCornerRadius)
+                            .stroke(Theme.green.opacity(0.3), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    appState.launchClaudeForCloudInstance(inst, project: project)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "play.rectangle")
+                        Text("Open in Instance")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.blue)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.blue.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.smallCornerRadius)
+                            .stroke(Theme.blue.opacity(0.3), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+            } else {
+                Menu {
+                    Section("Deploy to...") {
+                        ForEach(paired) { inst in
+                            Button(inst.name) {
+                                appState.syncProject(project, to: inst, direction: .push) { _, _ in }
+                            }
+                        }
+                    }
+                    Section("Open in Instance") {
+                        ForEach(paired) { inst in
+                            Button(inst.name) {
+                                appState.launchClaudeForCloudInstance(inst, project: project)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "cloud")
+                        Text("Cloud")
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8))
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.blue)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.blue.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.smallCornerRadius)
+                            .stroke(Theme.blue.opacity(0.3), lineWidth: 1)
+                    )
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
         }
     }
 

@@ -1,0 +1,1059 @@
+import SwiftUI
+
+/// Detail view for a selected cloud instance.
+struct CloudInstanceDetailView: View {
+    let instance: CloudInstance
+    @EnvironmentObject var appState: AppState
+    @State private var showConnectPanel = false
+    @State private var operationMessage: String?
+    @State private var operationSuccess: Bool?
+    @State private var showProjectPicker = false
+    @State private var syncConfirmation: (projectId: String, direction: AppState.SyncDirection)? = nil
+    @State private var automationTasks: [AppState.ScheduledTask] = []
+    @State private var automationCrons: [String: String] = [:]
+    @State private var automationSelected: Set<String> = []
+    @State private var automationProjectName: String = ""
+    @State private var automationMessage: String?
+
+    private var runtimeInfo: CloudInstanceRuntimeInfo {
+        appState.cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            instanceHeader
+
+            Divider()
+
+            ScrollView {
+                VStack(spacing: 16) {
+                    connectionConfigSection
+                    pairedProjectsSection
+                    automationsSection
+                }
+                .padding(20)
+            }
+        }
+        .background(Theme.pampas.opacity(0.3))
+        .sheet(isPresented: $showConnectPanel) {
+            ConnectPanelSheet(instance: instance)
+                .environmentObject(appState)
+        }
+        .onAppear {
+            automationTasks = appState.discoverScheduledTasks()
+        }
+        .alert("Confirm Sync", isPresented: Binding(
+            get: { syncConfirmation != nil },
+            set: { if !$0 { syncConfirmation = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { syncConfirmation = nil }
+            Button(syncConfirmation?.direction == .push ? "Push" : "Pull") {
+                if let conf = syncConfirmation,
+                   let project = appState.projects.first(where: { $0.id == conf.projectId }) {
+                    appState.syncProject(project, to: instance, direction: conf.direction) { s, m in
+                        showOperationMessage(m, success: s)
+                    }
+                }
+                syncConfirmation = nil
+            }
+        } message: {
+            if let conf = syncConfirmation {
+                let projectName = appState.projects.first(where: { $0.id == conf.projectId })?.name ?? "project"
+                let dir = conf.direction == .push ? "Push to" : "Pull from"
+                Text("\(dir) \(instance.name) for project \"\(projectName)\"?")
+            }
+        }
+    }
+
+    // MARK: - Header
+
+    private var instanceHeader: some View {
+        HStack(spacing: 12) {
+            CloudInstanceAvatar(instance: instance, size: 36, isSelected: true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    Text(instance.name)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Theme.textPrimary)
+
+                    Text(instance.type.displayName)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Theme.blue)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 7, height: 7)
+                    Text(runtimeInfo.status.displayName)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textTertiary)
+                    if let ip = runtimeInfo.publicIP {
+                        Text(ip)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                }
+            }
+
+            Spacer()
+
+            if let msg = operationMessage {
+                Text(msg)
+                    .font(.system(size: 11))
+                    .foregroundStyle(operationSuccess == true ? Theme.green : Theme.red)
+                    .transition(.opacity)
+            }
+
+            actionButtons
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(Theme.windowBackground)
+    }
+
+    private var statusColor: Color {
+        switch runtimeInfo.status {
+        case .running: return Theme.green
+        case .starting, .stopping: return Theme.orange
+        case .stopped, .terminated: return Theme.red
+        case .unknown: return Theme.midGray
+        }
+    }
+
+    private var actionButtons: some View {
+        HStack(spacing: 8) {
+            // Start/Stop/Terminate — context-dependent
+            switch instance.type {
+            case .ssh:
+                sshTestButton
+            case .ec2:
+                ec2ActionButtons
+            case .fargate:
+                fargateActionButtons
+            case .docker:
+                dockerActionButtons
+            }
+
+            // Launch Claude Desktop
+            launchClaudeButton
+
+            // Connect button
+            Button {
+                showConnectPanel = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "link")
+                    Text("Connect")
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.blue)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Theme.blue.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.smallCornerRadius)
+                        .stroke(Theme.blue.opacity(0.3), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var sshTestButton: some View {
+        Button {
+            showOperationMessage(nil)
+            appState.testSSHConnection(for: instance) { success, msg in
+                showOperationMessage(msg, success: success)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "bolt.horizontal")
+                Text("Test")
+            }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Theme.green)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var ec2ActionButtons: some View {
+        HStack(spacing: 6) {
+            if runtimeInfo.status == .stopped || runtimeInfo.status == .unknown {
+                lifecycleButton("Start", icon: "play.fill", color: Theme.green) {
+                    appState.ec2Start(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+            if runtimeInfo.status == .running {
+                lifecycleButton("Stop", icon: "stop.fill", color: Theme.orange) {
+                    appState.ec2Stop(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+            if runtimeInfo.status != .terminated {
+                lifecycleButton("Terminate", icon: "xmark.circle", color: Theme.red) {
+                    appState.ec2Terminate(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+        }
+    }
+
+    private var fargateActionButtons: some View {
+        HStack(spacing: 6) {
+            if runtimeInfo.status == .stopped || runtimeInfo.status == .unknown {
+                lifecycleButton("Run", icon: "play.fill", color: Theme.green) {
+                    appState.fargateRunTask(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+            if runtimeInfo.status == .running {
+                lifecycleButton("Stop", icon: "stop.fill", color: Theme.red) {
+                    appState.fargateStopTask(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+        }
+    }
+
+    private var dockerActionButtons: some View {
+        HStack(spacing: 6) {
+            let hasContainer = !(instance.dockerConfig?.containerId.isEmpty ?? true)
+
+            if !hasContainer {
+                lifecycleButton("Create", icon: "play.fill", color: Theme.green) {
+                    appState.dockerRun(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+            if hasContainer && (runtimeInfo.status == .stopped || runtimeInfo.status == .unknown) {
+                lifecycleButton("Start", icon: "play.fill", color: Theme.green) {
+                    appState.dockerStart(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+            if runtimeInfo.status == .running {
+                lifecycleButton("Stop", icon: "stop.fill", color: Theme.orange) {
+                    appState.dockerStop(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+            if hasContainer && runtimeInfo.status != .running {
+                lifecycleButton("Remove", icon: "trash", color: Theme.red) {
+                    appState.dockerRemove(instance) { s, m in showOperationMessage(m, success: s) }
+                }
+            }
+        }
+    }
+
+    private func lifecycleButton(_ title: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                Text(title)
+            }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(color)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func showOperationMessage(_ message: String?, success: Bool = false) {
+        withAnimation {
+            operationMessage = message
+            operationSuccess = success
+        }
+        if message != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                withAnimation { operationMessage = nil }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var launchClaudeButton: some View {
+        let pairedProjects = appState.projects.filter { instance.pairedProjectIds.contains($0.id) }
+
+        if pairedProjects.count <= 1 {
+            Button {
+                appState.launchClaudeForCloudInstance(instance, project: pairedProjects.first)
+                showOperationMessage("Launching Claude Desktop...", success: true)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "play.rectangle")
+                    Text("Claude Desktop")
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Theme.orange)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+            }
+            .buttonStyle(.plain)
+        } else {
+            Menu {
+                ForEach(pairedProjects) { project in
+                    Button(project.name) {
+                        appState.launchClaudeForCloudInstance(instance, project: project)
+                        showOperationMessage("Launching Claude Desktop...", success: true)
+                    }
+                }
+                Divider()
+                Button("Without project") {
+                    appState.launchClaudeForCloudInstance(instance)
+                    showOperationMessage("Launching Claude Desktop...", success: true)
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "play.rectangle")
+                    Text("Claude Desktop")
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8))
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Theme.orange)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+    }
+
+    // MARK: - Connection Config Section
+
+    private var connectionConfigSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionHeader("Connection Configuration")
+
+            VStack(spacing: 10) {
+                switch instance.type {
+                case .ssh: sshConfigFields
+                case .ec2: ec2ConfigFields
+                case .fargate: fargateConfigFields
+                case .docker: dockerConfigFields
+                }
+            }
+            .padding(16)
+            .background(Theme.cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.cornerRadius)
+                    .stroke(Theme.cardBorder, lineWidth: 1)
+            )
+        }
+    }
+
+    @State private var editableInstance: CloudInstance? = nil
+
+    private func binding<T>(for keyPath: WritableKeyPath<CloudInstance, T>) -> Binding<T> {
+        Binding(
+            get: { instance[keyPath: keyPath] },
+            set: { newValue in
+                var updated = instance
+                updated[keyPath: keyPath] = newValue
+                appState.updateCloudInstance(updated)
+            }
+        )
+    }
+
+    private var sshConfigFields: some View {
+        Group {
+            configField("Host", binding: sshBinding(\.host))
+            HStack(spacing: 12) {
+                configField("User", binding: sshBinding(\.user))
+                configField("Port", value: Binding(
+                    get: { String(instance.sshConfig?.port ?? 22) },
+                    set: { val in
+                        var updated = instance
+                        if updated.sshConfig == nil { updated.sshConfig = SSHConfig() }
+                        updated.sshConfig?.port = Int(val) ?? 22
+                        appState.updateCloudInstance(updated)
+                    }
+                ), width: 80)
+            }
+            keyPathField("SSH Key", binding: sshBinding(\.keyPath))
+        }
+    }
+
+    private var ec2ConfigFields: some View {
+        Group {
+            configField("Instance ID", binding: ec2Binding(\.instanceId))
+            HStack(spacing: 12) {
+                configField("Region", binding: ec2Binding(\.region))
+                configField("Instance Type", binding: ec2Binding(\.instanceType))
+            }
+            configField("AMI", binding: ec2Binding(\.ami))
+            HStack(spacing: 12) {
+                configField("Key Pair", binding: ec2Binding(\.keyPair))
+                configField("Security Group", binding: ec2Binding(\.securityGroup))
+            }
+            HStack(spacing: 12) {
+                configField("SSH User", binding: ec2Binding(\.sshUser))
+                keyPathField("SSH Key", binding: ec2Binding(\.sshKeyPath))
+            }
+        }
+    }
+
+    private var fargateConfigFields: some View {
+        Group {
+            HStack(spacing: 12) {
+                configField("Cluster", binding: fargateBinding(\.cluster))
+                configField("Region", binding: fargateBinding(\.region))
+            }
+            configField("Task Definition", binding: fargateBinding(\.taskDefinition))
+            configField("Task ARN", binding: fargateBinding(\.taskArn))
+            configField("Container Name", binding: fargateBinding(\.containerName))
+            HStack(spacing: 12) {
+                configField("SSH User", binding: fargateBinding(\.sshUser))
+                keyPathField("SSH Key", binding: fargateBinding(\.sshKeyPath))
+            }
+        }
+    }
+
+    private var dockerConfigFields: some View {
+        Group {
+            configField("Image", binding: dockerBinding(\.imageName))
+            HStack(spacing: 12) {
+                configField("Container Name", binding: dockerBinding(\.containerName))
+                configField("Container ID", binding: dockerBinding(\.containerId))
+            }
+            HStack(spacing: 12) {
+                configField("SSH Port", value: Binding(
+                    get: { String(instance.dockerConfig?.sshPort ?? 2222) },
+                    set: { val in
+                        var updated = instance
+                        if updated.dockerConfig == nil { updated.dockerConfig = DockerConfig() }
+                        updated.dockerConfig?.sshPort = Int(val) ?? 2222
+                        appState.updateCloudInstance(updated)
+                    }
+                ), width: 80)
+                configField("SSH User", binding: dockerBinding(\.sshUser))
+            }
+            keyPathField("SSH Key", binding: dockerBinding(\.sshKeyPath))
+        }
+    }
+
+    // MARK: - Config Binding Helpers
+
+    private func sshBinding(_ keyPath: WritableKeyPath<SSHConfig, String>) -> Binding<String> {
+        Binding(
+            get: { instance.sshConfig?[keyPath: keyPath] ?? "" },
+            set: { newValue in
+                var updated = instance
+                if updated.sshConfig == nil { updated.sshConfig = SSHConfig() }
+                updated.sshConfig?[keyPath: keyPath] = newValue
+                appState.updateCloudInstance(updated)
+            }
+        )
+    }
+
+    private func ec2Binding(_ keyPath: WritableKeyPath<EC2Config, String>) -> Binding<String> {
+        Binding(
+            get: { instance.ec2Config?[keyPath: keyPath] ?? "" },
+            set: { newValue in
+                var updated = instance
+                if updated.ec2Config == nil { updated.ec2Config = EC2Config() }
+                updated.ec2Config?[keyPath: keyPath] = newValue
+                appState.updateCloudInstance(updated)
+            }
+        )
+    }
+
+    private func fargateBinding(_ keyPath: WritableKeyPath<FargateConfig, String>) -> Binding<String> {
+        Binding(
+            get: { instance.fargateConfig?[keyPath: keyPath] ?? "" },
+            set: { newValue in
+                var updated = instance
+                if updated.fargateConfig == nil { updated.fargateConfig = FargateConfig() }
+                updated.fargateConfig?[keyPath: keyPath] = newValue
+                appState.updateCloudInstance(updated)
+            }
+        )
+    }
+
+    private func dockerBinding(_ keyPath: WritableKeyPath<DockerConfig, String>) -> Binding<String> {
+        Binding(
+            get: { instance.dockerConfig?[keyPath: keyPath] ?? "" },
+            set: { newValue in
+                var updated = instance
+                if updated.dockerConfig == nil { updated.dockerConfig = DockerConfig() }
+                updated.dockerConfig?[keyPath: keyPath] = newValue
+                appState.updateCloudInstance(updated)
+            }
+        )
+    }
+
+    // MARK: - Config Field Views
+
+    private func configField(_ label: String, binding: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textSecondary)
+            TextField("", text: binding)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+        }
+    }
+
+    private func configField(_ label: String, value: Binding<String>, width: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textSecondary)
+            TextField("", text: value)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .frame(width: width)
+        }
+    }
+
+    private func keyPathField(_ label: String, binding: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textSecondary)
+            HStack(spacing: 6) {
+                TextField("~/.ssh/id_rsa", text: binding)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.title = "Select SSH Key"
+                    panel.canChooseFiles = true
+                    panel.canChooseDirectories = false
+                    panel.allowsMultipleSelection = false
+                    panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory() + "/.ssh")
+                    if panel.runModal() == .OK, let url = panel.url {
+                        binding.wrappedValue = url.path
+                    }
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    // MARK: - Paired Projects Section
+
+    private var pairedProjectsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                sectionHeader("Paired Projects")
+                Spacer()
+                pairProjectMenu
+            }
+
+            if instance.pairedProjectIds.isEmpty {
+                Text("No projects paired with this instance")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textTertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 20)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(instance.pairedProjectIds, id: \.self) { projectId in
+                        pairedProjectRow(projectId: projectId)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(Theme.cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.cornerRadius)
+                .stroke(Theme.cardBorder, lineWidth: 1)
+        )
+    }
+
+    private var pairProjectMenu: some View {
+        let unpairedProjects = appState.projects.filter { !instance.pairedProjectIds.contains($0.id) }
+
+        return Menu {
+            if unpairedProjects.isEmpty {
+                Text("All projects are paired")
+            } else {
+                ForEach(unpairedProjects) { project in
+                    Button {
+                        appState.pairProject(project.id, with: instance.id)
+                    } label: {
+                        Label(project.name, systemImage: "folder")
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "plus")
+                Text("Pair Project")
+            }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(Theme.blue)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func pairedProjectRow(projectId: String) -> some View {
+        let project = appState.projects.first(where: { $0.id == projectId })
+        let name = project?.name ?? (projectId as NSString).lastPathComponent
+
+        return HStack(spacing: 10) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.orange)
+
+            Text(name)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Theme.textPrimary)
+
+            Spacer()
+
+            // Sync menu
+            Menu {
+                Button {
+                    syncConfirmation = (projectId: projectId, direction: .push)
+                } label: {
+                    Label("Push to Remote", systemImage: "arrow.up.circle")
+                }
+                Button {
+                    syncConfirmation = (projectId: projectId, direction: .pull)
+                } label: {
+                    Label("Pull from Remote", systemImage: "arrow.down.circle")
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    if runtimeInfo.isSyncing {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .frame(width: 10, height: 10)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    Text("Sync")
+                }
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Theme.green)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(runtimeInfo.isSyncing)
+
+            // Open in Instance
+            Button {
+                if let proj = project {
+                    appState.launchClaudeForCloudInstance(instance, project: proj)
+                    showOperationMessage("Launching Claude Desktop...", success: true)
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "terminal")
+                    Text("Open")
+                }
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Theme.orange)
+            }
+            .buttonStyle(.plain)
+            .disabled(project == nil)
+
+            Button {
+                appState.unpairProject(projectId, from: instance.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.red)
+            }
+            .buttonStyle(.plain)
+            .help("Unpair project")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Theme.pampas.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+        .overlay(alignment: .bottomTrailing) {
+            if let date = runtimeInfo.lastSyncDate {
+                Text("Synced \(date.formatted(.relative(presentation: .named)))")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.textTertiary)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 2)
+            } else if let error = runtimeInfo.lastSyncError {
+                Text("Sync error: \(error)")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.red)
+                    .lineLimit(1)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 2)
+            }
+        }
+    }
+
+    // MARK: - Automations Section
+
+    private var automationsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                sectionHeader("Automations")
+                Spacer()
+                Button {
+                    automationTasks = appState.discoverScheduledTasks()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("Refresh task list")
+            }
+
+            if automationTasks.isEmpty {
+                Text("No scheduled tasks found in ~/.claude/scheduled-tasks/")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textTertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 16)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(automationTasks) { task in
+                        automationTaskRow(task: task)
+                    }
+                }
+
+                if !instance.pairedProjectIds.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Target Project:")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Theme.textSecondary)
+                            Picker("", selection: $automationProjectName) {
+                                ForEach(instance.pairedProjectIds, id: \.self) { pid in
+                                    let name = appState.projects.first(where: { $0.id == pid })?.name ?? (pid as NSString).lastPathComponent
+                                    Text(name).tag(name)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 200)
+                        }
+
+                        HStack {
+                            Button {
+                                let selectedTasks = automationTasks
+                                    .filter { automationSelected.contains($0.id) }
+                                    .compactMap { task -> (task: AppState.ScheduledTask, cronExpression: String)? in
+                                        guard let cron = automationCrons[task.id], !cron.isEmpty else { return nil }
+                                        return (task: task, cronExpression: cron)
+                                    }
+                                let targetProject = automationProjectName.isEmpty
+                                    ? (appState.projects.first(where: { $0.id == instance.pairedProjectIds.first })?.name ?? "project")
+                                    : automationProjectName
+                                appState.deployAutomations(to: instance, tasks: selectedTasks, projectName: targetProject) { s, m in
+                                    automationMessage = m
+                                    showOperationMessage(m, success: s)
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.up.doc")
+                                    Text("Deploy Automations")
+                                }
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Theme.green)
+                                .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(automationSelected.isEmpty)
+
+                            if let msg = automationMessage {
+                                Text(msg)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.textTertiary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(Theme.cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.cornerRadius)
+                .stroke(Theme.cardBorder, lineWidth: 1)
+        )
+        .onAppear {
+            if automationProjectName.isEmpty,
+               let firstId = instance.pairedProjectIds.first,
+               let proj = appState.projects.first(where: { $0.id == firstId }) {
+                automationProjectName = proj.name
+            }
+        }
+    }
+
+    private func automationTaskRow(task: AppState.ScheduledTask) -> some View {
+        HStack(spacing: 10) {
+            Toggle("", isOn: Binding(
+                get: { automationSelected.contains(task.id) },
+                set: { checked in
+                    if checked { automationSelected.insert(task.id) }
+                    else { automationSelected.remove(task.id) }
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Theme.textPrimary)
+                if !task.description.isEmpty {
+                    Text(task.description)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer()
+
+            TextField("cron (e.g. 0 9 * * *)", text: Binding(
+                get: { automationCrons[task.id] ?? "" },
+                set: { automationCrons[task.id] = $0 }
+            ))
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 11, design: .monospaced))
+            .frame(width: 180)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Theme.pampas.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+    }
+
+    // MARK: - Helpers
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(Theme.textPrimary)
+    }
+}
+
+// MARK: - Connect Panel Sheet
+
+struct ConnectPanelSheet: View {
+    let instance: CloudInstance
+    @EnvironmentObject var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedTab = 0
+    @State private var tunnelMessage: String?
+
+    private var runtimeInfo: CloudInstanceRuntimeInfo {
+        appState.cloudInstanceRuntimeInfo[instance.id] ?? CloudInstanceRuntimeInfo()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Connect to \(instance.name)")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(20)
+
+            Divider()
+
+            // Tab picker
+            Picker("", selection: $selectedTab) {
+                Text("SSH").tag(0)
+                Text("VNC").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+
+            // Content
+            if selectedTab == 0 {
+                sshTab
+            } else {
+                vncTab
+            }
+
+            Spacer()
+
+            Divider()
+
+            // Tunnel controls
+            HStack {
+                let tunnelActive = runtimeInfo.tunnelPID != nil
+
+                Button {
+                    if tunnelActive {
+                        appState.closeTunnel(for: instance)
+                        tunnelMessage = "Tunnel closed"
+                    } else {
+                        appState.openTunnel(for: instance) { success, msg in
+                            tunnelMessage = msg
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(tunnelActive ? Theme.green : Theme.red)
+                            .frame(width: 6, height: 6)
+                        Text(tunnelActive ? "Close Tunnel" : "Open Tunnel")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                }
+
+                if let msg = tunnelMessage {
+                    Text(msg)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+
+                Spacer()
+
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+        }
+        .frame(width: 440, height: 380)
+    }
+
+    private var sshTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let cmd = appState.sshCommandString(for: instance) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("SSH Command")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+
+                    HStack {
+                        Text(cmd)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Theme.textPrimary)
+                            .textSelection(.enabled)
+
+                        Spacer()
+
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(cmd, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.blue)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copy to clipboard")
+                    }
+                    .padding(12)
+                    .background(Theme.pampas)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                }
+            } else {
+                Text("Configure SSH settings to see the connection command")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+
+            if let ip = runtimeInfo.publicIP {
+                HStack {
+                    Text("Public IP:")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                    Text(ip)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(Theme.textPrimary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .padding(20)
+    }
+
+    private var vncTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            let target = appState.resolveSSHTarget(for: instance)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("VNC Connection")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Theme.textSecondary)
+
+                if runtimeInfo.tunnelPID != nil {
+                    VStack(alignment: .leading, spacing: 6) {
+                        infoRow("Host", value: "localhost")
+                        infoRow("Port", value: "6080")
+                        infoRow("URL", value: "vnc://localhost:6080")
+                    }
+                    .padding(12)
+                    .background(Theme.pampas)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+
+                    Text("VNC is tunneled through SSH. Open a VNC client and connect to the address above.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                } else {
+                    Text("Open an SSH tunnel first to access VNC. The tunnel forwards port 6080 for VNC access.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textTertiary)
+                        .padding(12)
+                        .background(Theme.pampas)
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.smallCornerRadius))
+                }
+            }
+
+            if let host = target?.host {
+                HStack {
+                    Text("Remote host:")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                    Text(host)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(Theme.textPrimary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .padding(20)
+    }
+
+    private func infoRow(_ label: String, value: String) -> some View {
+        HStack {
+            Text(label + ":")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textSecondary)
+                .frame(width: 50, alignment: .leading)
+            Text(value)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(Theme.textPrimary)
+                .textSelection(.enabled)
+        }
+    }
+}
